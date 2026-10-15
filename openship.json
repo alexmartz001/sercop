@@ -1,0 +1,21 @@
+{
+  "$schema": "https://openship.io/openship.schema.json",
+  "framework": "node",
+  "packageManager": "npm",
+  "installCommand": "npm ci",
+  "startCommand": "node server.js",
+  "port": 3210,
+  "runtime": "docker",
+  "productionMode": "standalone",
+  "volumes": ["radar-data:/app/data"],
+  "env": {
+    "NVG_HOST": "0.0.0.0",
+    "NVG_PORT": "3210",
+    "NVG_DB": "/app/data/radar.db",
+    "NVG_AUTH": "on",
+    "NVG_AUTH_USER": "admin",
+    "NVG_TRUST_PROXY": "1",
+    "NVG_HSTS": "1",
+    "NVG_ALLOW_RESTORE": "0"
+  }
+}

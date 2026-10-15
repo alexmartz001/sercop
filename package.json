@@ -1,0 +1,19 @@
+{
+  "name": "sercop-radar",
+  "version": "11.0.0",
+  "description": "Radar de Oportunidades SERCOP · búsqueda, calificación y seguimiento comercial",
+  "main": "server.js",
+  "private": true,
+  "scripts": {
+    "start": "node server.js",
+    "test": "node --test test.js"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "dependencies": {
+    "better-sqlite3": "^13.0.3",
+    "exceljs": "^4.4.0",
+    "nodemailer": "^10.0.10"
+  }
+}
