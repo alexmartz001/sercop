@@ -73,6 +73,7 @@ let ExcelJS = null;
 const integrations = createIntegrations({ env: process.env, log: console });
 const sendMail = (...args) => integrations.sendMail(...args);
 const sendWebhook = (...args) => integrations.sendWebhook(...args);
+const sendTelegram = (...args) => integrations.sendTelegram(...args);
 function mailStatus(){ return integrations.status(); }
 const reminded = new Set();
 function daysLabel(d){ if(d===0) return 'hoy'; if(d===1) return '1 día'; return `${d} días`; }
@@ -103,13 +104,15 @@ async function sendClosingReminders(){
   const html = `<h3>Recordatorios de cierre</h3><table border="1" cellpadding="6"><tr><th>Entidad</th><th>Proceso</th><th>Cierre</th><th>Quedan</th></tr>${rowsHtml}</table>`;
   const subject = `[NVG] ${due.length} ${due.length===1?'cierre pronto':'cierres próximos'}`;
   if(st.email) await sendMail(subject, html);
-  // Webhook por cada recordatorio (Dynamics / Power Automate).
+  // Webhook y Telegram por cada recordatorio (Dynamics / Power Automate).
   for(const r of due){
-    await sendWebhook('reminder', {
+    const reminderData = {
       ocid: r.ocid, entidad: r.entidad || '', titulo: r.titulo || r.ocid,
       cierre: r.cierre, dias: r.days, valor: r.valor || null,
       url: sercopPublicUrl(r.ocid), destinatarios: st.to
-    });
+    };
+    await sendWebhook('reminder', reminderData);
+    if(st.telegram) await sendTelegram('reminder', reminderData);
     // Recordatorio de calendario en Outlook/M365 (opcional).
     if(st.calendar){
       const start = new Date(r.date); start.setHours(8, 0, 0, 0);
@@ -1340,10 +1343,12 @@ async function runMonitor(){
     const st = mailStatus();
     if(st.email) await sendMail(`[NVG] ${newAlertRows.length} nuevos procesos`, buildAlertsHtml(newAlertRows));
     for(const a of newAlertRows){
-      await sendWebhook('alert', {
+      const alertData = {
         radar: a.radar, ocid: a.ocid, titulo: a.title, entidad: a.buyer,
         tipo: a.type, url: sercopPublicUrl(a.ocid), destinatarios: st.to
-      });
+      };
+      await sendWebhook('alert', alertData);
+      if(st.telegram) await sendTelegram('alert', alertData);
     }
   }
   try{ await detectPipelineChanges(false); }
@@ -1647,11 +1652,14 @@ async function detectPipelineChanges(force){
   }
   dbRun("INSERT OR REPLACE INTO monitor_state(id, last_run) VALUES('__changes__', datetime('now'))");
   const st = mailStatus();
+  const tgOn = mailStatus().telegram;
   for(const c of changedList){
-    await sendWebhook('change', {
+    const changeData = {
       ocid: c.ocid, resumen: c.summary, entidad: c.entidad,
       url: sercopPublicUrl(c.ocid), destinatarios: st.to
-    });
+    };
+    await sendWebhook('change', changeData);
+    if(tgOn) await sendTelegram('change', changeData);
   }
   return changed;
 }
@@ -2226,11 +2234,12 @@ const server = http.createServer(async (req, res) => {
     }
     if(pathname === '/api/integrations/test' && req.method === 'POST'){
       const st = mailStatus();
-      const result = { ok: true, mail: false, webhook: false, provider: st.provider };
+      const result = { ok: true, mail: false, webhook: false, telegram: false, provider: st.provider };
       let body = {};
       try{ body = JSON.parse((await collectBody(req)).toString('utf8') || '{}'); }catch(_){}
       const doMail = body.mail !== false;
       const doWebhook = body.webhook !== false;
+      const doTelegram = body.telegram !== false;
       if(doMail){
         if(st.email){
           result.mail = await sendMail('[NVG] Prueba de integración',
@@ -2240,6 +2249,12 @@ const server = http.createServer(async (req, res) => {
       if(doWebhook){
         result.webhook = await sendWebhook('test', {
           mensaje: 'Prueba de webhook desde el Radar SERCOP',
+          estado: 'ok', prueba: true
+        });
+      }
+      if(doTelegram){
+        result.telegram = await sendTelegram('test', {
+          mensaje: 'Prueba de Telegram desde el Radar SERCOP',
           estado: 'ok', prueba: true
         });
       }
@@ -2634,6 +2649,9 @@ bootstrapAuth().then(() => {
     }
     if(ist.webhook){
       console.log(`  Integración webhook: activa (eventos: ${ist.webhookEvents.join(', ')}).`);
+    }
+    if(ist.telegram){
+      console.log(`  Integración Telegram: activa (chats: ${ist.telegramChats.join(', ')} · eventos: ${ist.telegramEvents.join(', ')}).`);
     }
     if(!ALLOW_RESTORE){
       console.log('  Seguridad: restauración de BD deshabilitada (NVG_ALLOW_RESTORE=0).');

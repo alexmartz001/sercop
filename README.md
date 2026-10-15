@@ -3,7 +3,8 @@
 Servidor Node.js sin framework (solo `better-sqlite3`, `exceljs`, `nodemailer`)
 que consulta APIs y portales públicos de contratación (SERCOP, BID, PNUD, NCO,
 PAC) y guarda resultados, pipeline comercial y planes en SQLite. Incluye login,
-sesiones, *hardening* HTTP y **integraciones salientes** con CRM (webhook) y
+sesiones, *hardening* HTTP y **integraciones salientes** con CRM (webhook),
+Telegram y
 Microsoft 365 / Outlook (Microsoft Graph).
 
 La auditoría de seguridad está en [`AUDITORIA.md`](./AUDITORIA.md).
@@ -118,6 +119,38 @@ añade una condición que compare `headers['x-nvg-signature']` con
 `sha256(concat(...))` del cuerpo; luego crea/actualiza el registro en Dynamics
 (*Create a record*, *Update a record*) o envía una notificación.
 
+
+## 4bis. Notificaciones por Telegram (Bot API)
+
+Además del webhook, el radar puede enviar los mismos eventos a **Telegram**
+(alertas de nuevos procesos, cambios de etapa y recordatorios de cierre).
+
+### Configuración
+
+1. Crea un bot con [@BotFather](https://t.me/BotFather) → obtén el token
+   (formato `123456789:AA...`).
+2. Obtén el chat ID:
+   - Usuario: escribe al bot y visita
+     `https://api.telegram.org/bot<TOKEN>/getUpdates` → `message.chat.id`.
+   - Grupo/canal: añade el bot como miembro/administrador y usa el ID
+     (`-100…` para canales/supergrupos) o el `@nombreusuario` del canal público.
+
+```env
+TELEGRAM_BOT_TOKEN=123456789:AAxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+TELEGRAM_CHAT_ID=-1001234567890        # admite varios separados por coma
+# TELEGRAM_EVENTS=alert,change,reminder,test   # eventos a notificar
+# TELEGRAM_DISABLE_PREVIEW=1                     # sin vista previa de enlaces (por defecto 1)
+# TELEGRAM_SILENT=0                              # 1 = mensajes sin sonido
+# TELEGRAM_TIMEOUT_MS=10000
+```
+
+Los mensajes se envían en formato HTML con escape seguro (entidad, título,
+OCID, enlace al proceso en SERCOP y días restantes en recordatorios). Si no se
+configura el bot, la integración queda inactiva sin afectar al resto.
+
+Prueba manual: `POST /api/integrations/test` con cuerpo `{ "telegram": true }`
+(o `{}` para probar correo + webhook + Telegram a la vez); la respuesta
+incluye `"telegram": true/false`.
 ---
 
 ## 5. Correo y recordatorios por Microsoft 365 / Outlook (Microsoft Graph)
@@ -193,12 +226,12 @@ curl -X POST https://tu-dominio/api/integrations/test \
 Respuesta:
 
 ```json
-{ "ok": true, "mail": true, "webhook": true, "provider": "graph" }
+{ "ok": true, "mail": true, "webhook": true, "telegram": true, "provider": "graph" }
 ```
 
-- `mail`/`webhook`: `true` si el envío se realizó.
+- `mail`/`webhook`/`telegram`: `true` si el envío se realizó.
 - `provider`: `graph` | `smtp` | `none`.
-- Puedes desactivar uno con `{"mail":false}` o `{"webhook":false}`.
+- Puedes desactivar cualquiera con `{"mail":false}`, `{"webhook":false}` o `{"telegram":false}`.
 - `GET /api/config` devuelve el estado (destinatarios, proveedor, si hay webhook
   y qué eventos envía).
 
@@ -210,7 +243,7 @@ Respuesta:
 |---------|-----|
 | `server.js` | Servidor HTTP, rutas, auth, monitor, planificador. |
 | `auth.js` | scrypt, sesiones, CSRF y limitador **persistente** (SQLite). |
-| `integrations.js` | Webhook (HMAC) + Microsoft Graph (correo/calendario) + SMTP. |
+| `integrations.js` | Webhook (HMAC) + Telegram (Bot API) + Microsoft Graph (correo/calendario) + SMTP. |
 | `sercop.html` | Panel (acciones delegadas por `data-act`, sin handlers inline). |
 | `login.html` | Página de login. |
 | `test.js` | 66 pruebas (API, sesión, limitador, integraciones, Graph). |

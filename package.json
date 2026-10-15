@@ -6,7 +6,7 @@
   "private": true,
   "scripts": {
     "start": "node server.js",
-    "test": "node --test test.js"
+    "test": "node --test --test-timeout=60000 test.js"
   },
   "engines": {
     "node": ">=22"
