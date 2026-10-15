@@ -6,8 +6,25 @@ const path = require('node:path');
 const auth = require('./auth');
 const { createIntegrations } = require('./integrations');
 
-const PORT = process.env.NVG_PORT || 3210;
-const HOST = process.env.NVG_HOST || '127.0.0.1';
+function resolveListenPort(){
+  const raw = process.env.NVG_PORT || process.env.PORT || '3210';
+  const n = Number(raw);
+  if(!Number.isInteger(n) || n < 1 || n > 65535){
+    console.error(`Puerto inválido "${raw}". Define NVG_PORT o PORT entre 1 y 65535.`);
+    process.exit(1);
+  }
+  return n;
+}
+// OpenShip inyecta PORT y publica ese puerto del contenedor. El edge llega por
+// la interfaz del bridge, no por el loopback de dentro del contenedor.
+function resolveListenHost(){
+  const explicit = String(process.env.NVG_HOST || '').trim();
+  if(explicit) return explicit;
+  if(process.env.PORT) return '0.0.0.0';
+  return '127.0.0.1';
+}
+const PORT = resolveListenPort();
+const HOST = resolveListenHost();
 const AUTH_TOKEN = process.env.NVG_TOKEN || '';
 const DB_FILE = process.env.NVG_DB || path.join(__dirname, 'radar.db');
 
@@ -129,7 +146,9 @@ async function sendClosingReminders(){
 
 let db;
 function initDB(){
-  db = new Database(DB_FILE);
+  const file = path.resolve(DB_FILE);
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  db = new Database(file);
   db.pragma('journal_mode = WAL');
   db.pragma('synchronous = NORMAL');
   db.exec(`CREATE TABLE IF NOT EXISTS radares(
@@ -2609,7 +2628,13 @@ async function bootstrapAuth(){
     return;
   }
   if(auth.countUsers(db) === 0){
-    const password = AUTH_PASS || auth.randomToken(9).replace(/[-_]/g, '').slice(0, 14);
+    let password = AUTH_PASS;
+    if(!password || password.length < auth.MIN_PASSWORD_LEN){
+      if(password){
+        console.warn(`  NVG_AUTH_PASS tiene menos de ${auth.MIN_PASSWORD_LEN} caracteres; se genera una contraseña temporal.`);
+      }
+      password = auth.randomToken(18).replace(/[-_]/g, '');
+    }
     await auth.createUser(db, AUTH_USER, password, 'admin');
     if(AUTH_PASS){
       console.log(`  Autenticación: usuario "${AUTH_USER}" creado desde NVG_AUTH_PASS.`);
@@ -2631,7 +2656,18 @@ async function bootstrapAuth(){
   }
 }
 
-initDB();
+server.on('error', (err) => {
+  console.error(`No se pudo escuchar en ${HOST}:${PORT}: ${err.message}`);
+  process.exit(1);
+});
+
+try{
+  initDB();
+}catch(e){
+  console.error(`No se pudo abrir la base de datos (${DB_FILE}): ${e.message}`);
+  console.error('Ese directorio tiene que existir y ser escribible. En OpenShip monta un volumen ahí (radar-data:/app/data).');
+  process.exit(1);
+}
 bootstrapAuth().then(() => {
   server.listen(PORT, HOST, () => {
     console.log(`\n  Radar SERCOP v11 — http://${HOST}:${PORT}`);

@@ -8,9 +8,9 @@
   "runtime": "docker",
   "productionMode": "standalone",
   "volumes": ["radar-data:/app/data"],
+  "domains": [{ "domain": "soce", "port": 3210, "type": "free" }],
   "env": {
     "NVG_HOST": "0.0.0.0",
-    "NVG_PORT": "3210",
     "NVG_DB": "/app/data/radar.db",
     "NVG_AUTH": "on",
     "NVG_AUTH_USER": "admin",

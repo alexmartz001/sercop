@@ -42,15 +42,28 @@ npm test
 
 ## 3. Despliegue en OpenShip (edge proxy con TLS)
 
-1. **Escucha detrás del proxy**: `NVG_HOST=0.0.0.0`.
+El dominio libre `soce.opsh.io` va en `openship.json` asignado al puerto **3210**,
+el mismo que publica el contenedor. OpenShip registra la ruta solo si ese
+contenedor sigue **en ejecución** y tiene publicado el 3210. Si el proceso sale
+al abrir SQLite (el directorio de `NVG_DB` no existía) el panel deja el dominio
+en «Verificado» y muestra «El enrutamiento del dominio necesita atención».
+
+1. **Escucha detrás del proxy**: `NVG_HOST=0.0.0.0`. Si OpenShip inyecta `PORT`
+   y no hay `NVG_HOST`, el servidor escucha en `0.0.0.0` en ese puerto.
 2. El edge **debe reenviar** `X-Forwarded-For` y `X-Forwarded-Proto: https`.
    Con eso se activan automáticamente la cookie `Secure` y HSTS.
-3. Define **`NVG_AUTH_PASS`** como secreto de la plataforma.
-4. **Persistencia**: apunta `NVG_DB` a un volumen que sobreviva a los reinicios.
+3. Define **`NVG_AUTH_PASS`** como secreto de la plataforma (mínimo 10 caracteres).
+4. **Persistencia**: `NVG_DB=/app/data/radar.db` con el volumen
+   `radar-data:/app/data`. El proceso crea el directorio si el volumen aún no
+   está montado, para no morir antes de escuchar.
 5. No despliegues `*.db`, `*.log` ni `.env` (ya están en `.gitignore`).
 6. Healthcheck sugerido: `GET /api/auth/session` (público, siempre responde).
 7. Si no usas el botón **Restaurar copia**, define **`NVG_ALLOW_RESTORE=0`**
    para deshabilitar la restauración completa de la BD (`POST /api/db` → 403).
+
+Tras el despliegue, en Dominios el hostname `soce.opsh.io` debe seguir en el
+puerto 3210. Si el aviso de enrutamiento continúa, reintenta el enrutamiento
+desde esa pestaña: el dominio ya verificado no se vuelve a comprobar solo.
 
 > **Timeouts:** `requestTimeout`/socket se dejan abiertos porque `/api/search`
 > usa **SSE** (conexión larga). `headersTimeout` es de 20 s (slowloris).
