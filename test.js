@@ -20,6 +20,40 @@ function cleanDB(){
   }
 }
 
+function apiStream(path, timeoutMs = 170000){
+  return new Promise((resolve, reject) => {
+    const url = new URL(path, BASE);
+    const req = http.request(url, {method:'GET'}, res => {
+      const chunks = [];
+      const timer = setTimeout(() => { req.destroy(new Error('stream timeout')); }, timeoutMs);
+      res.on('data', c => chunks.push(c));
+      res.on('end', () => {
+        clearTimeout(timer);
+        resolve({status: res.statusCode, body: Buffer.concat(chunks).toString()});
+      });
+    });
+    req.on('error', reject);
+    req.end();
+  });
+}
+
+function parseSSE(body){
+  const events = [];
+  for(const block of String(body || '').split('\n\n')){
+    let event = 'message';
+    const dataLines = [];
+    for(const line of block.split('\n')){
+      if(line.startsWith('event:')) event = line.slice(6).trim();
+      else if(line.startsWith('data:')) dataLines.push(line.slice(5).trim());
+    }
+    if(!dataLines.length) continue;
+    const raw = dataLines.join('');
+    try{ events.push({event, data: JSON.parse(raw)}); }
+    catch{ events.push({event, data: raw}); }
+  }
+  return events;
+}
+
 function api(path, opts={}){
   return new Promise((resolve, reject) => {
     const url = new URL(path, BASE);
@@ -430,6 +464,26 @@ describe('Server API', () => {
     assert.equal(r.json().ok, true);
     const list = await api('/api/pac/plan');
     assert.equal(list.status, 200);
+  });
+
+  it('búsqueda SERCOP sigue cuando una IP del portal no responde', {timeout: 90000}, async () => {
+    const id = 'r_sercop_live';
+    const created = await api('/api/radares', {method:'POST', body:{
+      id, nombre:'LOPDP', year:2026, source:'sercop', buyer:'', supplier:'',
+      search:'LOPDP'
+    }});
+    assert.equal(created.status, 201);
+    const r = await apiStream(`/api/search?radarId=${encodeURIComponent(id)}`);
+    assert.equal(r.status, 200);
+    const events = parseSSE(r.body);
+    const done = events.find(e => e.event === 'done');
+    assert.ok(done, 'la búsqueda debe emitir done');
+    const warnings = (done.data.warnings || []).join(' ');
+    assert.equal(warnings.includes('fetch failed'), false, warnings);
+    assert.equal(/conexión fallida|HTTP 429/.test(warnings), false, warnings);
+    assert.ok(done.data.total > 0, 'SERCOP debe devolver procesos para esas palabras');
+    const deleted = await api(`/api/radares/${id}`, {method:'DELETE'});
+    assert.equal(deleted.status, 200);
   });
 
 });

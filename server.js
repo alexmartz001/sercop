@@ -1,4 +1,6 @@
 const http = require('node:http');
+const https = require('node:https');
+const dns = require('node:dns');
 const crypto = require('node:crypto');
 const Database = require('better-sqlite3');
 const fs = require('node:fs');
@@ -424,30 +426,252 @@ function dbRun(sql, params=[]){
 }
 
 // -- SERCOP API Client ----------------------------------------------
-let fetchGate = Promise.resolve();
-async function waitForExternalFetchSlot(){
-  const slot = fetchGate.then(() => sleep(EXTERNAL_FETCH_DELAY));
-  fetchGate = slot.catch(() => {});
-  await slot;
+// datosabiertos.compraspublicas.gob.ec publica más de una IP. Una de ellas
+// deja la conexión colgada y el fetch nativo aborta con "fetch failed" sin
+// probar la otra. Aquí se recorren todas las direcciones, se recuerda la que
+// respondió y las peticiones salen de una en una para no disparar el cupo
+// (60/min, cabecera Retry-After).
+const CONNECT_TIMEOUT_MS = Math.max(2000, Number(process.env.NVG_CONNECT_TIMEOUT_MS) || 8000);
+const RESPONSE_TIMEOUT_MS = Math.max(5000, Number(process.env.NVG_RESPONSE_TIMEOUT_MS) || 30000);
+const HEALTHY_TTL_MS = 10 * 60 * 1000;
+const MAX_RESPONSE_BYTES = 25 * 1024 * 1024;
+const healthyAddress = new Map();
+let fetchChain = Promise.resolve();
+
+function enqueueExternalFetch(task){
+  const run = fetchChain.then(async () => {
+    await sleep(EXTERNAL_FETCH_DELAY);
+    return task();
+  });
+  fetchChain = run.then(() => {}, () => {});
+  return run;
+}
+
+function lookupPinned(address, family){
+  return function lookup(_hostname, options, cb){
+    if(typeof options === 'function'){ cb = options; options = {}; }
+    const fam = family || (String(address).includes(':') ? 6 : 4);
+    // El callback de lookup tiene que ser asíncrono. Si se llama en el mismo
+    // turno, Node pierde el socket y la petición se queda hasta el timeout.
+    process.nextTick(() => {
+      if(options && options.all) cb(null, [{address, family: fam}]);
+      else cb(null, address, fam);
+    });
+  };
+}
+
+async function resolveHostAddresses(hostname){
+  let records = [];
+  try{
+    records = await dns.promises.lookup(hostname, {all: true});
+  }catch(e){
+    throw Object.assign(new Error(`no se pudo resolver ${hostname}`), {code: e.code || 'ENOTFOUND'});
+  }
+  const addrs = [];
+  const sorted = [...records].sort((a, b) => Number(a.family) - Number(b.family));
+  for(const rec of sorted){
+    if(rec?.address && !addrs.some(a => a.address === rec.address)) addrs.push({address: rec.address, family: rec.family});
+  }
+  if(!addrs.length) throw Object.assign(new Error(`DNS sin direcciones para ${hostname}`), {code: 'ENOTFOUND'});
+  const healthy = healthyAddress.get(hostname);
+  if(healthy && healthy.until > Date.now()){
+    const idx = addrs.findIndex(a => a.address === healthy.address);
+    if(idx > 0){
+      const [hit] = addrs.splice(idx, 1);
+      addrs.unshift(hit);
+    }
+  }
+  return addrs;
+}
+
+function headerGet(headers, name){
+  const v = headers[String(name).toLowerCase()];
+  if(v == null) return null;
+  return Array.isArray(v) ? v.join(', ') : String(v);
+}
+
+function requestOnce(urlObj, opts, target){
+  let req;
+  let settled = false;
+  let rejectFn = () => {};
+  const promise = new Promise((resolve, reject) => {
+    rejectFn = reject;
+    const fail = (err) => {
+      if(settled) return;
+      settled = true;
+      if(err && !err.address) err.address = target.address;
+      reject(err);
+    };
+    const lib = urlObj.protocol === 'https:' ? https : http;
+    const headers = {'Accept':'application/json', 'User-Agent':'NVG-Radar/11', ...(opts.headers || {})};
+    const body = opts.body == null ? null : (Buffer.isBuffer(opts.body) ? opts.body : Buffer.from(String(opts.body)));
+    if(body && !Object.keys(headers).some(k => k.toLowerCase() === 'content-length')){
+      headers['Content-Length'] = String(body.length);
+    }
+    req = lib.request({
+      protocol: urlObj.protocol,
+      hostname: urlObj.hostname,
+      servername: urlObj.hostname,
+      port: urlObj.port || (urlObj.protocol === 'https:' ? 443 : 80),
+      path: `${urlObj.pathname}${urlObj.search}`,
+      method: opts.method || 'GET',
+      headers,
+      lookup: lookupPinned(target.address, target.family),
+      timeout: CONNECT_TIMEOUT_MS,
+      autoSelectFamily: false,
+      agent: false
+    }, (res) => {
+      req.setTimeout(RESPONSE_TIMEOUT_MS);
+      const chunks = [];
+      let size = 0;
+      res.on('data', (c) => {
+        size += c.length;
+        if(size > MAX_RESPONSE_BYTES){
+          fail(Object.assign(new Error('respuesta demasiado grande'), {code:'ERR_BODY_TOO_LARGE'}));
+          req.destroy();
+          return;
+        }
+        chunks.push(c);
+      });
+      res.on('end', () => {
+        if(settled) return;
+        settled = true;
+        const buf = Buffer.concat(chunks);
+        const status = res.statusCode || 0;
+        resolve({
+          status,
+          ok: status >= 200 && status < 300,
+          headers: {get: (name) => headerGet(res.headers, name)},
+          text: async () => buf.toString('utf8'),
+          json: async () => JSON.parse(buf.toString('utf8')),
+          address: target.address
+        });
+      });
+      res.on('error', fail);
+    });
+    req.on('timeout', () => {
+      fail(Object.assign(new Error(`tiempo de conexión agotado (${target.address})`), {code:'ETIMEDOUT', address: target.address}));
+      req.destroy();
+    });
+    req.on('error', fail);
+    if(body) req.write(body);
+    req.end();
+  });
+  return {
+    promise,
+    abort(){
+      if(settled) return;
+      settled = true;
+      try{
+        if(req){
+          req.setTimeout(0);
+          if(req.socket) req.socket.destroy();
+          req.destroy();
+        }
+      }catch(_){}
+      rejectFn(Object.assign(new Error('abort'), {code:'ABORT', address: target.address}));
+    }
+  };
+}
+
+async function requestFirstReachable(urlObj, opts, targets){
+  let lastErr = null;
+  for(const target of targets){
+    const handle = requestOnce(urlObj, opts, target);
+    try{
+      const resp = await handle.promise;
+      if(resp.status >= 500 || resp.status === 408){
+        lastErr = new Error(`HTTP ${resp.status}`);
+        console.warn(`  ${urlObj.hostname} vía ${target.address}: HTTP ${resp.status}`);
+        continue;
+      }
+      return resp;
+    }catch(e){
+      lastErr = e;
+      if(e.code !== 'ABORT') console.warn(`  ${urlObj.hostname} vía ${target.address}: ${e.code || e.message}`);
+    }
+  }
+  const detail = lastErr ? (lastErr.code || lastErr.message) : 'sin respuesta';
+  throw Object.assign(new Error(`conexión fallida con ${urlObj.hostname} (${detail})`), {code: lastErr?.code || 'ECONN'});
+}
+
+function retryAfterMs(resp, attempt){
+  const raw = resp?.headers?.get?.('retry-after');
+  if(raw != null && String(raw).trim() !== ''){
+    const sec = Number(raw);
+    if(Number.isFinite(sec) && sec >= 0) return Math.min(sec * 1000, 60000);
+  }
+  const reset = Number(resp?.headers?.get?.('x-ratelimit-reset'));
+  if(Number.isFinite(reset) && reset > 0){
+    const ms = reset > 1e12 ? reset - Date.now() : reset * 1000 - Date.now();
+    if(ms > 0 && ms < 120000) return ms;
+  }
+  return Math.min(2000 * Math.pow(2, attempt), 15000);
+}
+
+async function fetchOnceWithFailover(url, opts, redirects = 0){
+  const urlObj = new URL(url);
+  const all = await resolveHostAddresses(urlObj.hostname);
+  const healthy = healthyAddress.get(urlObj.hostname);
+  const pinned = healthy && healthy.until > Date.now() ? all.filter(a => a.address === healthy.address) : [];
+  const targets = pinned.length ? [...pinned, ...all.filter(a => a.address !== pinned[0].address)] : all;
+  let resp;
+  try{
+    resp = await requestFirstReachable(urlObj, opts, targets);
+  }catch(e){
+    if(pinned.length) healthyAddress.delete(urlObj.hostname);
+    throw e;
+  }
+  const method = String(opts.method || 'GET').toUpperCase();
+  if(redirects < 4 && [301, 302, 303, 307, 308].includes(resp.status) && (method === 'GET' || method === 'HEAD')){
+    const loc = resp.headers.get('location');
+    if(loc) return fetchOnceWithFailover(new URL(loc, url).toString(), opts, redirects + 1);
+  }
+  if(resp.address && (resp.ok || resp.status === 429 || (resp.status >= 400 && resp.status < 500))){
+    healthyAddress.set(urlObj.hostname, {address: resp.address, until: Date.now() + HEALTHY_TTL_MS});
+  }
+  return resp;
 }
 
 async function fetchWithRetry(url, opts={}, retries=MAX_RETRIES){
   const okStatuses = Array.isArray(opts.okStatuses) ? opts.okStatuses : [];
   const fetchOpts = {...opts};
   delete fetchOpts.okStatuses;
+  return enqueueExternalFetch(() => fetchWithRetryUnlocked(url, fetchOpts, okStatuses, retries));
+}
+
+async function fetchWithRetryUnlocked(url, fetchOpts, okStatuses, retries){
+  let lastErr = null;
   for(let attempt = 0; attempt <= retries; attempt++){
-    await waitForExternalFetchSlot();
-    const resp = await fetch(url, fetchOpts);
-    if(resp.status === 429 && attempt < retries){
-      const wait = Math.min(2000 * Math.pow(2, attempt), 15000) + Math.floor(Math.random() * 500);
-      console.warn(`  429 rate limit, waiting ${wait}ms (attempt ${attempt+1}/${retries})`);
+    let resp;
+    try{
+      resp = await fetchOnceWithFailover(url, fetchOpts);
+    }catch(e){
+      lastErr = e;
+      if(attempt >= retries) break;
+      const wait = Math.min(1000 * Math.pow(2, attempt), 8000);
+      console.warn(`  reintento ${attempt + 1}/${retries} tras fallo de red: ${e.message}`);
       await sleep(wait);
+      continue;
+    }
+    if(resp.status === 429 && attempt < retries){
+      const wait = retryAfterMs(resp, attempt) + Math.floor(Math.random() * 250);
+      console.warn(`  429 rate limit, waiting ${wait}ms (attempt ${attempt + 1}/${retries})`);
+      await sleep(wait);
+      lastErr = new Error('HTTP 429');
       continue;
     }
     if(okStatuses.includes(resp.status)) return resp;
     if(!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    const remainHeader = resp.headers.get('x-ratelimit-remaining');
+    if(remainHeader != null && remainHeader !== '' && Number(remainHeader) === 0){
+      const wait = retryAfterMs(resp, 0);
+      if(wait > 0) await sleep(Math.min(wait, 60000));
+    }
     return resp;
   }
+  if(lastErr) throw lastErr;
+  throw new Error('HTTP 429');
 }
 
 function getCached(url){
