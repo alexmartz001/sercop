@@ -132,6 +132,13 @@ Severidad: Crítico / Alto / Medio / Bajo · Estado: ✅ Remediado · 🟡 Mitig
   `X-NVG-Signature: sha256=<HMAC-SHA256>` (`NVG_WEBHOOK_SECRET`) más un `Bearer`
   opcional (`NVG_WEBHOOK_BEARER`). Se puede filtrar por eventos con
   `NVG_WEBHOOK_EVENTS` (`alert,change,reminder`, por defecto).
+- **Notificaciones por Telegram** (Bot API): con `TELEGRAM_BOT_TOKEN` +
+  `TELEGRAM_CHAT_ID` (admite varios chats separados por coma; usuario, grupo o
+  canal) envía los eventos `alert`, `change`, `reminder` y `test` como mensajes
+  HTML con escape seguro (entidad, título, OCID, enlace al proceso y días de
+  cierre). Filtrable con `TELEGRAM_EVENTS`; opcionalmente `TELEGRAM_SILENT=1`
+  (sin sonido), `TELEGRAM_DISABLE_PREVIEW` y `TELEGRAM_TIMEOUT_MS`. Si no hay
+  configuración, queda inactiva sin afectar al resto.
 - **Correo por Microsoft Graph** (Microsoft 365 / Outlook, OAuth2 *app-only*):
   token por *client credentials* y envío vía `/users/{sender}/sendMail`; guarda
   copia en Enviados si `GRAPH_SAVE_TO_SENT=1`. Alternativa por **SMTP**
@@ -141,7 +148,7 @@ Severidad: Crítico / Alto / Medio / Bajo · Estado: ✅ Remediado · 🟡 Mitig
 - **Eventos** emitidos: `alert` (procesos nuevos), `change` (cambios de etapa en
   el pipeline), `reminder` (cierres próximos), `test` (prueba manual).
 - **Prueba manual**: `POST /api/integrations/test` (autenticado) devuelve
-  `{ok, mail, webhook, provider}` sin esperar al monitor.
+  `{ok, mail, webhook, telegram, provider}` sin esperar al monitor.
 
 ### Compatibilidad
 

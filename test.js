@@ -729,6 +729,11 @@ describe('Integraciones (webhook + Graph)', () => {
   const INT_BASE = `http://localhost:${INT_PORT}`;
   const INT_DB = path.join(__dirname, 'test_integrations.db');
   const HOOK_SECRET = 'secreto-de-prueba';
+  const TG_TOKEN = '123456:TEST-token-telegram';
+  const TG_PORT = 32150;
+  const TG_BASE = `http://127.0.0.1:${TG_PORT}`;
+  let tgServer;
+  let tgReceived = [];
   let srv;
   let hookServer;
   let hookPort;
@@ -754,6 +759,8 @@ describe('Integraciones (webhook + Graph)', () => {
       const p = path.join(__dirname, f);
       if(fs.existsSync(p)) fs.unlinkSync(p);
     }
+    // Receptor local de Telegram (falso Bot API) para validar la integración.
+    process.env.TELEGRAM_API_BASE = TG_BASE;
     // Receptor local del webhook.
     hookServer = http.createServer((req, res) => {
       const chunks = [];
@@ -767,13 +774,28 @@ describe('Integraciones (webhook + Graph)', () => {
     await new Promise(resolve => hookServer.listen(0, '127.0.0.1', resolve));
     hookPort = hookServer.address().port;
 
+    // Falso servidor de la Bot API de Telegram.
+    tgServer = http.createServer((req, res) => {
+      const chunks = [];
+      req.on('data', c => chunks.push(c));
+      req.on('end', () => {
+        tgReceived.push({ url: req.url, body: (() => { try { return JSON.parse(Buffer.concat(chunks).toString()); } catch (_) { return {}; } })() });
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end('{\"ok\":true,\"result\":{}}');
+      });
+    });
+    await new Promise(resolve => tgServer.listen(TG_PORT, '127.0.0.1', resolve));
+
     const { fork } = require('node:child_process');
     srv = fork(path.join(__dirname, 'server.js'), [], {
       env: {
         ...process.env, NVG_PORT: INT_PORT, NVG_DB: INT_DB, NVG_AUTH: 'off',
         NVG_WEBHOOK_URL: `http://127.0.0.1:${hookPort}/hook`,
         NVG_WEBHOOK_SECRET: HOOK_SECRET,
-        NVG_WEBHOOK_EVENTS: 'test,alert,change,reminder'
+        NVG_WEBHOOK_EVENTS: 'test,alert,change,reminder',
+        TELEGRAM_BOT_TOKEN: TG_TOKEN,
+        TELEGRAM_CHAT_ID: '-1001234567890',
+        TELEGRAM_API_BASE: TG_BASE
       },
       stdio: 'pipe'
     });
@@ -787,6 +809,8 @@ describe('Integraciones (webhook + Graph)', () => {
   after(async () => {
     if(srv){ const p = new Promise(resolve => { srv.on('exit', resolve); srv.kill(); }); await Promise.race([p, new Promise(r => setTimeout(r, 1500))]); }
     if(hookServer){ await new Promise(resolve => hookServer.close(resolve)); }
+    if(tgServer){ await new Promise(resolve => tgServer.close(resolve)); }
+    delete process.env.TELEGRAM_API_BASE;
     for(const f of ['test_integrations.db','test_integrations.db-wal','test_integrations.db-shm']){
       const p = path.join(__dirname, f);
       if(fs.existsSync(p)) fs.unlinkSync(p);
@@ -799,6 +823,8 @@ describe('Integraciones (webhook + Graph)', () => {
     const d = r.json();
     assert.equal(d.webhook, true);
     assert.ok(Array.isArray(d.webhookEvents));
+    assert.equal(d.telegram, true);
+    assert.deepEqual(d.telegramChats, ['-1001234567890']);
     assert.equal(d.provider, 'none');
     assert.equal(d.email, false);
   });
@@ -809,6 +835,7 @@ describe('Integraciones (webhook + Graph)', () => {
     assert.equal(r.status, 200);
     assert.equal(r.json().ok, true);
     assert.equal(r.json().webhook, true);
+    assert.equal(r.json().telegram, true);
     // Espera breve a que el receptor procese.
     for(let i = 0; i < 20 && !received.length; i++) await new Promise(res => setTimeout(res, 50));
     assert.equal(received.length, 1, 'se esperaba 1 webhook recibido');
@@ -818,6 +845,37 @@ describe('Integraciones (webhook + Graph)', () => {
     assert.equal(payload.source, 'nvg-radar');
     const expected = 'sha256=' + crypto.createHmac('sha256', HOOK_SECRET).update(raw).digest('hex');
     assert.equal(headers['x-nvg-signature'], expected);
+  });
+
+  it('POST /api/integrations/test envía un mensaje por Telegram (Bot API)', async () => {
+    tgReceived = [];
+    const r = await iapi('/api/integrations/test', { method: 'POST', body: { mail: false, webhook: false } });
+    assert.equal(r.status, 200);
+    assert.equal(r.json().telegram, true);
+    for(let i = 0; i < 20 && !tgReceived.length; i++) await new Promise(res => setTimeout(res, 50));
+    assert.equal(tgReceived.length, 1, 'se esperaba 1 mensaje Telegram recibido');
+    const msg = tgReceived[0];
+    assert.ok(msg.url.includes(`/bot${TG_TOKEN}/sendMessage`), 'debe usar la ruta de la Bot API con el token');
+    assert.equal(msg.body.chat_id, '-1001234567890');
+    assert.equal(msg.body.parse_mode, 'HTML');
+    assert.ok(String(msg.body.text).includes('Prueba'), 'el texto debe provenir del evento test');
+  });
+});
+
+describe('formatTelegramMessage (unidad)', () => {
+  const { formatTelegramMessage } = require('./integrations');
+  it('formatea alertas con escape HTML', () => {
+    const t = formatTelegramMessage('alert', { ocid: 'OC-1', entidad: 'A <B>', titulo: 'Compra & más', tipo: 'pac_matched', url: 'https://x/1' });
+    assert.ok(t.includes('Nuevo proceso'));
+    assert.ok(t.includes('PAC ✓'));
+    assert.ok(t.includes('A &lt;B&gt;'));
+    assert.ok(t.includes('Compra &amp; m'));
+    assert.ok(t.includes('<a href=\"https://x/1\">'));
+  });
+  it('formatea cambios y recordatorios', () => {
+    assert.ok(formatTelegramMessage('change', { ocid: 'OC-2', resumen: 'etapa: calificada' }).includes('Cambio en proceso'));
+    assert.ok(formatTelegramMessage('reminder', { ocid: 'OC-3', cierre: '2026-10-20', dias: 2 }).includes('Cierre próximo'));
+    assert.ok(formatTelegramMessage('reminder', { ocid: 'OC-3', cierre: '2026-10-20', dias: 0 }).includes('hoy'));
   });
 });
 

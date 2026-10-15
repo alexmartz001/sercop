@@ -1293,6 +1293,7 @@ async function updateDbStatus(){
       }
       if(cfg.calendar) parts.push('calendario: activo');
       parts.push(cfg.webhook ? `webhook: activo (${(cfg.webhookEvents||[]).join(', ')})` : 'webhook: no configurado');
+      parts.push(cfg.telegram ? `Telegram: activo (${(cfg.telegramChats||[]).join(', ')})` : 'Telegram: no configurado');
       $('mailStatus').textContent = parts.join(' · ');
     }
   }catch(e){}

@@ -11,6 +11,11 @@
 //      - SMTP (nodemailer) como alternativa.
 //      - Recordatorios de calendario opcionales vía Graph (eventos con alarma).
 //
+//  · Notificaciones por Telegram (Bot API):
+//      - TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID (o varios separados por coma).
+//      - Se envían los mismos eventos que el webhook (TELEGRAM_EVENTS).
+//      - Soporta chat directo, grupo o canal (@usuario / -100…).
+//
 // Todo es opcional: si no hay configuración, las funciones devuelven false sin
 // romper el servidor.
 // ─────────────────────────────────────────────────────────────────────────────
@@ -59,13 +64,60 @@ function buildConfig(env){
       bearer: pick(env, 'NVG_WEBHOOK_BEARER'),
       events: listOf(pick(env, 'NVG_WEBHOOK_EVENTS') || 'alert,change,reminder').map(s => s.toLowerCase()),
       timeoutMs: Math.max(1000, num(pick(env, 'NVG_WEBHOOK_TIMEOUT_MS'), 10000))
+    },
+    telegram: {
+      botToken: pick(env, 'TELEGRAM_BOT_TOKEN'),
+      chatIds: listOf(pick(env, 'TELEGRAM_CHAT_ID')),
+      events: listOf(pick(env, 'TELEGRAM_EVENTS') || 'alert,change,reminder,test').map(s => s.toLowerCase()),
+      disablePreview: bool(pick(env, 'TELEGRAM_DISABLE_PREVIEW'), true),
+      silent: bool(pick(env, 'TELEGRAM_SILENT'), false),
+      timeoutMs: Math.max(1000, num(pick(env, 'TELEGRAM_TIMEOUT_MS'), 10000)),
+      apiBase: pick(env, 'TELEGRAM_API_BASE') || 'https://api.telegram.org'
     }
   };
   cfg.mail.graphReady = cfg.mail.provider === 'graph'
     && !!(cfg.mail.graph.tenant && cfg.mail.graph.clientId && cfg.mail.graph.clientSecret && cfg.mail.graph.sender);
   cfg.mail.smtpReady = !!(cfg.mail.smtp.host && cfg.mail.from && cfg.mail.to.length);
   cfg.webhook.ready = !!cfg.webhook.url;
+  cfg.telegram.ready = !!(cfg.telegram.botToken && cfg.telegram.chatIds.length);
   return cfg;
+}
+
+function tgEscape(s){
+  return String(s == null ? '' : s)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+// Formatea un mensaje compacto en HTML de Telegram a partir del evento.
+// Exportada también desde createIntegrations como `formatMessage` para poder
+// instanciar integraciones con una API base personalizada (tests/mock).
+function formatTelegramMessage(event, data){
+  const d = data || {};
+  const url = d.url ? ` <a href="${tgEscape(d.url)}">ver</a>` : '';
+  if(event === 'alert'){
+    const tipo = d.tipo === 'pac_matched' ? ' · <b>PAC ✓</b>' : '';
+    return `📡 <b>Nuevo proceso</b>${tipo}\n` +
+      `🏛 ${tgEscape(d.entidad || '')}\n` +
+      `🔎 <b>${tgEscape(d.titulo || d.ocid || '')}</b>\n` +
+      `ℹ️ ${tgEscape(d.ocid || '')}${url}`;
+  }
+  if(event === 'change'){
+    return `🔄 <b>Cambio en proceso seguido</b>\n` +
+      `🏛 ${tgEscape(d.entidad || '')}\n` +
+      `ℹ️ ${tgEscape(d.ocid || '')}\n` +
+      `📌 ${tgEscape(d.resumen || '')}${url}`;
+  }
+  if(event === 'reminder'){
+    const dias = Number.isFinite(d.dias) ? `⏳ cierra en ${d.dias === 0 ? 'hoy' : d.dias + ' día(s)'}` : '';
+    return `⏰ <b>Cierre próximo</b>\n` +
+      `🏛 ${tgEscape(d.entidad || '')}\n` +
+      `🔎 <b>${tgEscape(d.titulo || d.ocid || '')}</b>\n` +
+      `📅 ${tgEscape(d.cierre || '')}${dias ? '\n' + dias : ''}${url}`;
+  }
+  if(event === 'test'){
+    return `🧪 <b>Prueba de integración</b>\n${tgEscape(d.mensaje || 'Mensaje de prueba del Radar SERCOP')}`;
+  }
+  return `🔔 <b>${tgEscape(event)}</b>\n<pre>${tgEscape(JSON.stringify(d, null, 1).slice(0, 900))}</pre>`;
 }
 
 function createIntegrations({ env = process.env, log = console } = {}){
@@ -221,6 +273,63 @@ function createIntegrations({ env = process.env, log = console } = {}){
     }
   }
 
+  // ── Telegram (Bot API) ─────────────────────────────────────────────────────
+  async function sendTelegramChat(chatId, text, allowRetry = true){
+    const { botToken, apiBase, timeoutMs, disablePreview, silent } = cfg.telegram;
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+    try{
+      const resp = await fetch(`${apiBase}/bot${botToken}/sendMessage`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'User-Agent': 'NVG-Radar/11' },
+        body: JSON.stringify({
+          chat_id: chatId,
+          text: text.slice(0, 4096),
+          parse_mode: 'HTML',
+          disable_web_page_preview: disablePreview,
+          disable_notification: silent
+        }),
+        signal: ctrl.signal
+      });
+      const data = await resp.json().catch(() => ({}));
+      if(resp.status === 429 && allowRetry){
+        // Rate-limit: Telegram indica en parameters.retry_after cuántos segundos esperar.
+        const wait = Math.min(30, Math.max(1, Number(data.parameters && data.parameters.retry_after) || 3));
+        log.warn(`  [Telegram] rate-limit chat ${chatId}: reintento en ${wait}s`);
+        await new Promise(r => setTimeout(r, wait * 1000));
+        return sendTelegramChat(chatId, text, false);
+      }
+      if(!resp.ok || !data.ok){
+        log.error(`  [Telegram] error chat ${chatId}: HTTP ${resp.status} ${String(data.description || '').slice(0, 200)}`);
+        return false;
+      }
+      return true;
+    }catch(e){
+      log.error(`  [Telegram] error chat ${chatId}:`, e.message);
+      return false;
+    }finally{
+      clearTimeout(timer);
+    }
+  }
+
+  async function sendTelegram(event, data){
+    if(!cfg.telegram.ready) return false;
+    const ev = String(event).toLowerCase();
+    if(!cfg.telegram.events.includes(ev)) return false;
+    const text = formatTelegramMessage(ev, data);
+    // Envío paralelo a todos los chats configurados (más rápido y tolerante:
+    // un chat caído no retrasa ni bloquea a los demás).
+    const results = await Promise.all(cfg.telegram.chatIds.map(async (chatId) => {
+      const ok = await sendTelegramChat(chatId, text);
+      if(ok) log.log(`  [Telegram] ${ev} -> chat ${chatId}`);
+      return ok;
+    }));
+    return results.some(Boolean);
+  }
+
+  // Rate-limit de Telegram: 429 con retry-after → reintento único tras la espera.
+  // (Se maneja dentro de sendTelegramChat mediante el parámetro de reintento.)
+
   // ── Estado ─────────────────────────────────────────────────────────────────
   function status(){
     return {
@@ -229,11 +338,14 @@ function createIntegrations({ env = process.env, log = console } = {}){
       calendar: !!(cfg.mail.graphReady && cfg.mail.graph.calendar),
       to: cfg.mail.to,
       webhook: cfg.webhook.ready,
-      webhookEvents: cfg.webhook.events
+      webhookEvents: cfg.webhook.events,
+      telegram: cfg.telegram.ready,
+      telegramChats: cfg.telegram.chatIds,
+      telegramEvents: cfg.telegram.events
     };
   }
 
-  return { config: cfg, sendMail, sendWebhook, createCalendarReminder, status, graphAccessToken, htmlToText };
+  return { config: cfg, sendMail, sendWebhook, sendTelegram, createCalendarReminder, status, graphAccessToken, htmlToText, formatMessage: formatTelegramMessage };
 }
 
-module.exports = { createIntegrations, buildConfig };
+module.exports = { createIntegrations, buildConfig, formatTelegramMessage };
