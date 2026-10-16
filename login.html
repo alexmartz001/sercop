@@ -44,8 +44,8 @@
     <div class="brand">
       <span class="mark">NVG</span>
       <div>
-        <h1>Radar de Oportunidades</h1>
-        <div class="sub">Acceso restringido · SERCOP Ecuador</div>
+        <h1 id="title">Radar de Oportunidades</h1>
+        <div class="sub" id="subtitle">Acceso restringido · SERCOP Ecuador</div>
       </div>
     </div>
 
@@ -54,6 +54,11 @@
 
     <label for="password">Contraseña</label>
     <input type="password" id="password" name="password" autocomplete="current-password" required>
+
+    <div id="confirmWrap" hidden>
+      <label for="password2">Repetir contraseña</label>
+      <input type="password" id="password2" name="password2" autocomplete="new-password">
+    </div>
 
     <button type="submit" id="btnLogin">Ingresar</button>
     <div class="msg" id="msg"></div>
@@ -70,30 +75,49 @@
   const msg = document.getElementById('msg');
   const btn = document.getElementById('btnLogin');
   const params = new URLSearchParams(location.search);
+  let setupMode = false;
 
   function show(kind, text){ msg.className = 'msg ' + kind; msg.textContent = text; }
+
+  function enableSetup(suggested){
+    setupMode = true;
+    document.getElementById('title').textContent = 'Definir acceso';
+    document.getElementById('subtitle').textContent = 'Este despliegue no trajo una clave nueva';
+    document.getElementById('confirmWrap').hidden = false;
+    document.getElementById('password').autocomplete = 'new-password';
+    document.getElementById('username').value = suggested || 'admin';
+    btn.textContent = 'Crear acceso';
+    show('info', 'No se generó otra contraseña. Elige la del administrador: mínimo 10 caracteres. Los datos ya guardados se conservan.');
+  }
 
   if(params.get('expired')) show('info', 'Tu sesión expiró. Vuelve a ingresar.');
   if(params.get('logout')) show('info', 'Sesión cerrada correctamente.');
 
-  // Si ya hay una sesión válida, pasa directo al panel.
+  // Si ya hay una sesión válida, pasa directo al panel. Si el despliegue no
+  // tiene clave, el formulario pasa a definirla aquí.
   fetch('/api/auth/session', { credentials: 'same-origin' })
     .then(r => r.json())
-    .then(s => { if(s && s.authenticated) location.replace('/'); })
+    .then(s => {
+      if(s && s.authenticated){ location.replace('/'); return; }
+      if(s && s.setupRequired) enableSetup(s.suggestedUsername);
+    })
     .catch(() => {});
 
   form.addEventListener('submit', async (e) => {
     e.preventDefault();
     const username = document.getElementById('username').value.trim();
     const password = document.getElementById('password').value;
+    const password2 = document.getElementById('password2').value;
     if(!username || !password){ show('error', 'Ingresa usuario y contraseña.'); return; }
-    btn.disabled = true; btn.textContent = 'Verificando…'; msg.className = 'msg';
+    if(setupMode && password !== password2){ show('error', 'Las contraseñas no coinciden.'); return; }
+    if(setupMode && password.length < 10){ show('error', 'La contraseña debe tener al menos 10 caracteres.'); return; }
+    btn.disabled = true; btn.textContent = setupMode ? 'Guardando…' : 'Verificando…'; msg.className = 'msg';
     try{
-      const resp = await fetch('/api/auth/login', {
+      const resp = await fetch(setupMode ? '/api/auth/setup' : '/api/auth/login', {
         method: 'POST',
         credentials: 'same-origin',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ username, password })
+        body: JSON.stringify(setupMode ? { username, password, passwordConfirm: password2 } : { username, password })
       });
       const data = await resp.json().catch(() => ({}));
       if(resp.ok && data.ok){
@@ -104,6 +128,12 @@
       if(resp.status === 429){
         const secs = Math.ceil((data.retryAfterMs || 0) / 1000) || 60;
         show('error', `Demasiados intentos. Espera ${secs >= 60 ? Math.ceil(secs/60) + ' min' : secs + ' s'} e inténtalo de nuevo.`);
+      } else if(resp.status === 409){
+        setupMode = false;
+        document.getElementById('confirmWrap').hidden = true;
+        document.getElementById('title').textContent = 'Radar de Oportunidades';
+        btn.textContent = 'Ingresar';
+        show('error', 'El acceso ya fue definido. Entra con esa contraseña.');
       } else {
         show('error', data.error || 'Usuario o contraseña incorrectos.');
       }
@@ -111,8 +141,8 @@
       show('error', 'No se pudo contactar el servidor.');
     }finally{
       btn.disabled = false;
-      if(btn.textContent !== 'Entrando…') btn.textContent = 'Ingresar';
-      document.getElementById('password').value = '';
+      if(btn.textContent !== 'Entrando…') btn.textContent = setupMode ? 'Crear acceso' : 'Ingresar';
+      if(!setupMode) document.getElementById('password').value = '';
     }
   });
 })();

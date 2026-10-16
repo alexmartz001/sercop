@@ -668,12 +668,14 @@ describe('Auth (sesión con cookie + CSRF)', () => {
     const r = await sapi('/login');
     assert.equal(r.status, 200);
     assert.ok(r.body.includes('Radar de Oportunidades'));
+    assert.ok(r.body.includes('Definir acceso'));
   });
 
   it('GET /api/auth/session reports unauthenticated', async () => {
     const r = await sapi('/api/auth/session');
     assert.equal(r.status, 200);
     assert.equal(r.json().authenticated, false);
+    assert.equal(r.json().setupRequired, false);
   });
 
   it('rejects /api/* without session (401)', async () => {
@@ -727,21 +729,29 @@ describe('Auth (sesión con cookie + CSRF)', () => {
 
   it('changes the password and invalidates the old one', async () => {
     const NEWPASS = 'otra-clave-larga-456';
-    const r = await sapi('/api/auth/change-password', { method: 'POST', cookie, headers: { 'X-CSRF-Token': csrf }, body: { currentPassword: PASS, newPassword: NEWPASS } });
+    const THIRD = 'tercera-clave-7890';
+    // El panel envía current/next; la API también acepta currentPassword/newPassword.
+    const r = await sapi('/api/auth/change-password', { method: 'POST', cookie, headers: { 'X-CSRF-Token': csrf }, body: { current: PASS, next: NEWPASS } });
     assert.equal(r.status, 200);
     assert.equal(r.json().ok, true);
     const newCookie = extractCookie(r);
     assert.ok(newCookie);
     const newCsrf = r.json().csrf;
-    // La contraseña anterior ya no sirve.
     const oldLogin = await sapi('/api/auth/login', { method: 'POST', body: { username: USER, password: PASS } });
     assert.equal(oldLogin.status, 401);
-    // La nueva sí.
     const newLogin = await sapi('/api/auth/login', { method: 'POST', body: { username: USER, password: NEWPASS } });
     assert.equal(newLogin.status, 200);
     cookie = extractCookie(newLogin);
     csrf = newLogin.json().csrf;
-    assert.ok(cookie && csrf);
+    const again = await sapi('/api/auth/change-password', { method: 'POST', cookie, headers: { 'X-CSRF-Token': csrf }, body: { currentPassword: NEWPASS, newPassword: THIRD } });
+    assert.equal(again.status, 200);
+    const thirdLogin = await sapi('/api/auth/login', { method: 'POST', body: { username: USER, password: THIRD } });
+    assert.equal(thirdLogin.status, 200);
+    const stale = await sapi('/api/auth/login', { method: 'POST', body: { username: USER, password: NEWPASS } });
+    assert.equal(stale.status, 401);
+    cookie = extractCookie(thirdLogin);
+    csrf = thirdLogin.json().csrf;
+    assert.ok(cookie && csrf && newCsrf);
   });
 
   it('rejects oversized JSON bodies (413)', async () => {
@@ -764,6 +774,165 @@ describe('Auth (sesión con cookie + CSRF)', () => {
       if(r.status === 429){ saw429 = true; break; }
     }
     assert.ok(saw429, 'se esperaba un 429 tras varios intentos fallidos');
+  });
+});
+
+describe('Acceso inicial sin clave oculta', () => {
+  const SETUP_PORT = 3217;
+  const SETUP_BASE = `http://127.0.0.1:${SETUP_PORT}`;
+  const SETUP_DB = path.join(__dirname, 'test_setup.db');
+  const RECLAIM_PORT = 3218;
+  const RECLAIM_BASE = `http://127.0.0.1:${RECLAIM_PORT}`;
+  const RECLAIM_DB = path.join(__dirname, 'test_reclaim.db');
+  const OLD_PASS = 'clave-original-oculta';
+  const NEW_PASS = 'clave-definida-en-login';
+  let setupSrv;
+  let reclaimSrv;
+  let setupLog = '';
+  let reclaimLog = '';
+
+  function httpJson(base, path, opts = {}){
+    return new Promise((resolve, reject) => {
+      const url = new URL(path, base);
+      const headers = { 'Content-Type': 'application/json', ...(opts.headers || {}) };
+      if(opts.cookie) headers.Cookie = opts.cookie;
+      const req = http.request(url, { method: opts.method || 'GET', headers }, res => {
+        const chunks = [];
+        res.on('data', c => chunks.push(c));
+        res.on('end', () => {
+          const body = Buffer.concat(chunks).toString();
+          resolve({
+            status: res.statusCode,
+            headers: res.headers,
+            body,
+            json: () => { try{ return JSON.parse(body); }catch(_){ return null; } }
+          });
+        });
+      });
+      req.on('error', reject);
+      if(opts.body) req.write(JSON.stringify(opts.body));
+      req.end();
+    });
+  }
+
+  function startSrv(port, dbFile, extraEnv = {}){
+    const { fork } = require('node:child_process');
+    const chunks = [];
+    const srv = fork(path.join(__dirname, 'server.js'), [], {
+      env: {
+        ...process.env,
+        NVG_PORT: String(port),
+        NVG_DB: dbFile,
+        NVG_AUTH: 'on',
+        NVG_AUTH_USER: 'admin',
+        NVG_AUTH_PASS: '',
+        NVG_SECURE_COOKIES: '0',
+        NVG_HOST: '127.0.0.1',
+        ...extraEnv
+      },
+      stdio: 'pipe'
+    });
+    srv.stdout.on('data', d => chunks.push(d.toString()));
+    srv.stderr.on('data', d => chunks.push(d.toString()));
+    const ready = new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => reject(new Error('startup timeout '+port+'\n'+chunks.join(''))), STARTUP_TIMEOUT_MS);
+      srv.stdout.on('data', d => {
+        if(d.toString().includes(':' + port)){ clearTimeout(timeout); resolve(); }
+      });
+      srv.on('error', e => { clearTimeout(timeout); reject(e); });
+    });
+    return { srv, ready, log: () => chunks.join('') };
+  }
+
+  async function stopSrv(srv){
+    if(!srv) return;
+    const p = new Promise(resolve => { srv.on('exit', resolve); srv.kill(); });
+    await Promise.race([p, new Promise(r => setTimeout(r, 1500))]);
+  }
+
+  before(async () => {
+    for(const f of ['test_setup.db','test_setup.db-wal','test_setup.db-shm','test_reclaim.db','test_reclaim.db-wal','test_reclaim.db-shm']){
+      const p = path.join(__dirname, f);
+      if(fs.existsSync(p)) fs.unlinkSync(p);
+    }
+    const Database = require('better-sqlite3');
+    const seeded = new Database(RECLAIM_DB);
+    auth.initSchema(seeded);
+    await auth.createUser(seeded, 'admin', OLD_PASS, 'admin', { claimed: false });
+    seeded.exec(`CREATE TABLE IF NOT EXISTS radares(
+      id TEXT PRIMARY KEY, nombre TEXT, year INTEGER, search TEXT,
+      buyer TEXT, supplier TEXT, source TEXT,
+      created_at TEXT DEFAULT (datetime('now')))`);
+    seeded.prepare("INSERT INTO radares(id, nombre, year, search, source) VALUES('r1','Radar vivo',2026,'agua','sercop')").run();
+    seeded.close();
+
+    const setup = startSrv(SETUP_PORT, SETUP_DB, { NVG_AUTH_PASS: 'corta' });
+    const reclaim = startSrv(RECLAIM_PORT, RECLAIM_DB);
+    setupSrv = setup.srv;
+    reclaimSrv = reclaim.srv;
+    await Promise.all([setup.ready, reclaim.ready]);
+    setupLog = setup.log();
+    reclaimLog = reclaim.log();
+  });
+
+  after(async () => {
+    await stopSrv(setupSrv);
+    await stopSrv(reclaimSrv);
+    for(const f of ['test_setup.db','test_setup.db-wal','test_setup.db-shm','test_reclaim.db','test_reclaim.db-wal','test_reclaim.db-shm']){
+      const p = path.join(__dirname, f);
+      if(fs.existsSync(p)) fs.unlinkSync(p);
+    }
+  });
+
+  it('defines the password on /login when the deploy did not provide one', async () => {
+    assert.doesNotMatch(setupLog, /Contraseña:/);
+    assert.match(setupLog, /no se generó otra clave/i);
+    const session = await httpJson(SETUP_BASE, '/api/auth/session');
+    assert.equal(session.json().setupRequired, true);
+    assert.equal(session.json().suggestedUsername, 'admin');
+    const login = await httpJson(SETUP_BASE, '/api/auth/login', { method: 'POST', body: { username: 'admin', password: 'corta' } });
+    assert.equal(login.status, 401);
+    const page = await httpJson(SETUP_BASE, '/login');
+    assert.equal(page.status, 200);
+    assert.match(page.body, /Definir acceso/);
+    const bad = await httpJson(SETUP_BASE, '/api/auth/setup', { method: 'POST', body: { username: 'admin', password: NEW_PASS, passwordConfirm: 'otra-distinta-12' } });
+    assert.equal(bad.status, 400);
+    const created = await httpJson(SETUP_BASE, '/api/auth/setup', { method: 'POST', body: { username: 'admin', password: NEW_PASS, passwordConfirm: NEW_PASS } });
+    assert.equal(created.status, 200);
+    assert.equal(created.json().ok, true);
+    const setCookie = (created.headers['set-cookie'] || [])[0] || '';
+    assert.match(setCookie, /nvg_session=/);
+    const again = await httpJson(SETUP_BASE, '/api/auth/setup', { method: 'POST', body: { username: 'admin', password: NEW_PASS, passwordConfirm: NEW_PASS } });
+    assert.equal(again.status, 409);
+    const closed = await httpJson(SETUP_BASE, '/api/auth/session');
+    assert.equal(closed.json().setupRequired, false);
+
+    await stopSrv(setupSrv);
+    const restarted = startSrv(SETUP_PORT, SETUP_DB);
+    setupSrv = restarted.srv;
+    await restarted.ready;
+    const after = await httpJson(SETUP_BASE, '/api/auth/session');
+    assert.equal(after.json().setupRequired, false);
+    assert.equal(after.json().authenticated, false);
+    const relogin = await httpJson(SETUP_BASE, '/api/auth/login', { method: 'POST', body: { username: 'admin', password: NEW_PASS } });
+    assert.equal(relogin.status, 200);
+    const hidden = await httpJson(SETUP_BASE, '/api/auth/login', { method: 'POST', body: { username: 'admin', password: 'corta' } });
+    assert.equal(hidden.status, 401);
+  });
+
+  it('drops an unused generated password and keeps radar data', async () => {
+    assert.match(reclaimLog, /No se generó una clave nueva/);
+    assert.doesNotMatch(reclaimLog, new RegExp(OLD_PASS));
+    const session = await httpJson(RECLAIM_BASE, '/api/auth/session');
+    assert.equal(session.json().setupRequired, true);
+    const oldLogin = await httpJson(RECLAIM_BASE, '/api/auth/login', { method: 'POST', body: { username: 'admin', password: OLD_PASS } });
+    assert.equal(oldLogin.status, 401);
+    const created = await httpJson(RECLAIM_BASE, '/api/auth/setup', { method: 'POST', body: { username: 'admin', password: NEW_PASS, passwordConfirm: NEW_PASS } });
+    assert.equal(created.status, 200);
+    const cookie = ((created.headers['set-cookie'] || [])[0] || '').split(';')[0];
+    const list = await httpJson(RECLAIM_BASE, '/api/radares', { cookie });
+    assert.equal(list.status, 200);
+    assert.match(list.body, /Radar vivo/);
   });
 });
 
