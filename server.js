@@ -85,6 +85,7 @@ const EXTERNAL_FETCH_DELAY = Number(process.env.NVG_FETCH_DELAY_MS) || 750;
 const DETAIL_CONCURRENCY = 8;
 const PLANNING_CONCURRENCY = 5;
 const CACHE_TTL = 24 * 60 * 60 * 1000;
+const SEARCH_CACHE_MS = 15 * 60 * 1000;
 const MONITOR_INTERVAL = 5 * 60 * 1000;
 let ExcelJS = null;
 
@@ -709,12 +710,12 @@ async function sercopHttpDetail(resp){
   return detail ? `HTTP ${resp.status}: ${detail}` : `HTTP ${resp.status}`;
 }
 
-function getCached(url){
+function getCached(url, maxAge = CACHE_TTL){
   const row = dbGet("SELECT response, fetched_at FROM api_cache WHERE url = ?", [url]);
   if(!row) return null;
   const age = Date.now() - new Date(row.fetched_at).getTime();
-  if(age < CACHE_TTL) return row.response;
-  dbRun("DELETE FROM api_cache WHERE url = ?", [url]);
+  if(age < maxAge) return row.response;
+  if(age >= CACHE_TTL) dbRun("DELETE FROM api_cache WHERE url = ?", [url]);
   return null;
 }
 
@@ -722,9 +723,9 @@ function setCache(url, response){
   dbRun("INSERT OR REPLACE INTO api_cache(url, response, fetched_at) VALUES(?,?, datetime('now'))", [url, response]);
 }
 
-async function fetchCached(url, opts, force){
+async function fetchCached(url, opts, force, maxAge = CACHE_TTL){
   if(!force){
-    const cached = getCached(url);
+    const cached = getCached(url, maxAge);
     if(cached) return JSON.parse(cached);
   }
   const resp = await fetchWithRetry(url, opts);
@@ -834,23 +835,64 @@ function sercopDistinctTokens(term){
   return termTokens(term).filter(token => token.length >= 6 && token !== phrase);
 }
 
+const SERCOP_SYNONYMS = [
+  {keys:['pentest','pentesting'], queries:['ethical hacking','pruebas de penetracion']},
+  {keys:['hacking etico'], queries:['ethical hacking']},
+  {keys:['27001','iso27001'], queries:['seguridad de la informacion']},
+  {keys:['lopdp'], queries:['proteccion de datos personales']}
+];
+
+function sercopSynonymQueries(term){
+  const phrase = normTxt(term).trim().replace(/\s+/g, ' ');
+  const tokens = new Set(termTokens(term));
+  const out = [];
+  for(const entry of SERCOP_SYNONYMS){
+    if(!entry.keys.some(key => key === phrase || tokens.has(key))) continue;
+    for(const query of entry.queries){
+      if(!out.includes(query)) out.push(query);
+    }
+  }
+  return out.slice(0, 2);
+}
+
 function sercopQueryVariants(term){
   const phrase = String(term || '').trim().replace(/\s+/g, ' ');
   const variants = [];
-  if(phrase) variants.push(phrase);
-  const seen = new Set(variants.map(v => normTxt(v)));
-  for(const token of sercopDistinctTokens(term)){
-    if(seen.has(token)) continue;
-    seen.add(token);
-    variants.push(token);
-  }
+  const seen = new Set();
+  const push = (value) => {
+    const key = normTxt(value);
+    if(!value || seen.has(key) || variants.length >= 4) return;
+    seen.add(key);
+    variants.push(value);
+  };
+  for(const token of sercopDistinctTokens(term)) push(token);
+  push(phrase);
+  for(const extra of sercopSynonymQueries(term)) push(extra);
   return variants;
 }
 
+function phraseInText(text, phrase){
+  const haystack = normTxt(text);
+  const normalized = normTxt(phrase).trim().replace(/\s+/g, ' ');
+  if(!normalized) return false;
+  const phraseRe = new RegExp(`(^|[^a-z0-9])${escapeRe(normalized).replace(/\\ /g, '\\s+')}([^a-z0-9]|$)`);
+  return phraseRe.test(haystack);
+}
+
+function sercopMatchText(row){
+  const copy = {...row};
+  // Un código como SIE-MDMQ-2026-27001-41357 no es una mención a la norma.
+  if(titleLooksLikeCode(copy.title, copy.ocid)) copy.title = '';
+  return rowSearchText(copy);
+}
+
 function sercopTextMatches(row, term){
-  const text = rowSearchText(row);
+  const text = sercopMatchText(row);
   if(textContainsTerm(text, term)) return true;
-  return sercopDistinctTokens(term).some(token => textContainsTerm(text, token));
+  if(sercopDistinctTokens(term).some(token => textContainsTerm(text, token))) return true;
+  // El sinónimo tiene que aparecer como frase. «seguridad» + «información»
+  // sueltas en un contrato de obra no equivalen a ISO 27001.
+  return sercopSynonymQueries(term).some(query => phraseInText(text, query));
 }
 
 function sercopSummaryIsCode(row){
@@ -869,10 +911,7 @@ function tagSercopTerm(row, term){
 }
 
 function sercopRowRelevant(row, term){
-  if(sercopTextMatches(row, term)) return true;
-  if(!sercopSummaryIsCode(row)) return false;
-  const tagged = Array.isArray(row?._matchedTerms) ? row._matchedTerms : [];
-  return tagged.some(t => normTxt(t) === normTxt(term));
+  return sercopTextMatches(row, term);
 }
 
 function ncoMatchesTerm(row, term){
@@ -898,29 +937,39 @@ async function fetchSERCOPPages(search, year, buyer, supplier, onProgress, force
   let page = 1, pages = 1;
   const out = [];
   let lastData = null;
+  let livePages = 0;
   do{
     const params = new URLSearchParams({year: query.year, search: query.search, page});
     if(query.buyer) params.set('buyer', query.buyer);
     if(query.supplier) params.set('supplier', query.supplier);
-    lastData = await fetchCached(`${SERCOP_API}/search_ocds?${params.toString()}`, {retries: 1}, force);
+    const url = `${SERCOP_API}/search_ocds?${params.toString()}`;
+    const fresh = force ? null : getCached(url, SEARCH_CACHE_MS);
+    if(fresh) lastData = JSON.parse(fresh);
+    else {
+      lastData = await fetchCached(url, {retries: 1}, true);
+      livePages++;
+    }
     const rows = Array.isArray(lastData?.data) ? lastData.data : (Array.isArray(lastData) ? lastData : []);
     out.push(...rows);
     pages = Number(lastData?.pages || lastData?.total_pages || 1) || 1;
     if(onProgress) onProgress({type:'page', term: progressTerm || search, page, pages, count:out.length});
     page++;
-    if(page <= pages && page <= MAX_PAGES) await sleep(PAGE_DELAY);
+    if(page <= pages && page <= MAX_PAGES && !fresh) await sleep(PAGE_DELAY);
   } while(page <= pages && page <= MAX_PAGES);
-  return {out, truncated: pages > MAX_PAGES, totalAvailable: out.length, skipped:null, query};
+  return {out, truncated: pages > MAX_PAGES, totalAvailable: out.length, skipped:null, query, cached: livePages === 0};
 }
 
 async function fetchSERCOPAllPages(term, year, buyer, supplier, onProgress, force){
   const variants = sercopQueryVariants(term);
   const seen = new Set();
   const out = [];
+  const codeOnly = [];
   let truncated = false;
   let query = null;
   let skipped = null;
   let lastErr = null;
+  let cached = true;
+  let queried = false;
   for(const variant of variants){
     let page;
     try{
@@ -937,18 +986,63 @@ async function fetchSERCOPAllPages(term, year, buyer, supplier, onProgress, forc
       continue;
     }
     skipped = null;
+    queried = true;
+    if(!page.cached) cached = false;
     if(page.truncated) truncated = true;
     for(const row of page.out){
-      if(!acceptSercopApiHit(row, term)) continue;
       const k = String(row?.ocid || JSON.stringify([row?.title, row?.buyer, row?.date]));
       if(seen.has(k)) continue;
-      seen.add(k);
-      out.push(tagSercopTerm(row, term));
+      if(sercopTextMatches(row, term)){
+        seen.add(k);
+        out.push(tagSercopTerm(row, term));
+      } else if(sercopSummaryIsCode(row)){
+        seen.add(k);
+        codeOnly.push(row);
+      }
     }
   }
-  if(!out.length && skipped && !lastErr) return {out, truncated:false, totalAvailable:0, skipped, query};
-  if(!out.length && lastErr) throw lastErr;
-  return {out, truncated, totalAvailable: out.length, skipped:null, query};
+  const base = {truncated, query, cached: queried && cached, codeOnly};
+  if(!out.length && !codeOnly.length && skipped && !lastErr) return {out, codeOnly, truncated:false, totalAvailable:0, skipped, query, cached:false};
+  if(!out.length && !codeOnly.length && lastErr && !queried) throw lastErr;
+  return {out, ...base, totalAvailable: out.length, skipped:null};
+}
+
+async function sercopRecordText(ocid){
+  const resp = await fetchWithRetry(`${SERCOP_API}/record?ocid=${encodeURIComponent(ocid)}`, {
+    headers:{'Accept':'application/json'},
+    retries: 0,
+    connectTimeout: 4000
+  });
+  const data = await resp.json();
+  const bits = [];
+  for(const rel of collectReleases(data)){
+    bits.push(rel?.tender?.title, rel?.tender?.description, rel?.planning?.rationale, rel?.planning?.project?.title);
+    const items = [...(rel?.tender?.items || []), ...(rel?.planning?.items || [])];
+    for(const it of items) bits.push(it?.description, it?.classification?.description);
+  }
+  return bits.filter(Boolean).join(' ');
+}
+
+async function confirmCodeOnlyRows(rows, term){
+  const confirmed = [];
+  const started = Date.now();
+  for(const row of rows.slice(0, 3)){
+    if(Date.now() - started > 6000) break;
+    const ocid = String(row?.ocid || '');
+    if(!ocid) continue;
+    try{
+      const extra = await sercopRecordText(ocid);
+      if(!extra) continue;
+      const probe = {...row, description: `${row.description || ''} ${extra}`};
+      if(!sercopTextMatches(probe, term)) continue;
+      row.description = extra.slice(0, 400);
+      if(titleLooksLikeCode(row.title, ocid)) row.title = extra.slice(0, 160);
+      confirmed.push(tagSercopTerm(row, term));
+    }catch(e){
+      console.warn(`  ficha ${ocid}: ${e.message}`);
+    }
+  }
+  return confirmed;
 }
 
 async function fetchSERCOPByCPC(cpcCode, year, buyer, onProgress, force){
@@ -962,7 +1056,7 @@ async function fetchSERCOPByCPC(cpcCode, year, buyer, onProgress, force){
   do{
     const params = new URLSearchParams({year: query.year, search: query.search, page});
     if(query.buyer) params.set('buyer', query.buyer);
-    lastData = await fetchCached(`${SERCOP_API}/search_ocds?${params.toString()}`, {retries: 1}, force);
+    lastData = await fetchCached(`${SERCOP_API}/search_ocds?${params.toString()}`, {retries: 1}, force, SEARCH_CACHE_MS);
     const rows = Array.isArray(lastData?.data) ? lastData.data : (Array.isArray(lastData) ? lastData : []);
     const exposesClass = rows.some(row => Array.isArray(row?.items) && row.items.length);
     const filtered = exposesClass ? rows.filter(row => {
@@ -1630,18 +1724,30 @@ function planMatchesRow(radarId, row){
 // -- Batch Detail Fetch ---------------------------------------------
 async function fetchDetailBatch(ocids){
   const results = {};
-  for(let i = 0; i < ocids.length; i += DETAIL_CONCURRENCY){
-    const chunk = ocids.slice(i, i + DETAIL_CONCURRENCY);
-    const batch = await Promise.all(chunk.map(async ocid => {
-      try {
-        const det = await fetchDetail(ocid);
-        return {ocid, detail:det};
-      } catch(e){
-        return {ocid, error:e.message};
-      }
-    }));
-    for(const r of batch){ results[r.ocid] = r.detail || null; if(r.detail) saveDetail(r.ocid, r.detail); }
+  const missing = [];
+  for(const ocid of ocids){
+    const cached = getDetail(ocid);
+    if(cached) results[ocid] = cached;
+    else missing.push(ocid);
   }
+  // La tabla ya está pintada. Las fichas en caché salen ya; las que faltan
+  // no retienen la respuesta si el portal está limitado.
+  if(!missing.length) return results;
+  const live = (async () => {
+    const deadline = Date.now() + 6000;
+    for(const ocid of missing){
+      if(Date.now() >= deadline) break;
+      try{
+        const det = await fetchDetail(ocid, false, {fast:true});
+        if(det) results[ocid] = det;
+      }catch(e){
+        console.warn(`  detalle ${ocid}: ${e.message}`);
+        if(/429|ETIMEDOUT|ECONNRESET|conexión fallida|timeout/i.test(String(e.message))) break;
+      }
+    }
+  })();
+  // Si el portal está limitado, igual devolvemos las fichas que ya están en disco.
+  await Promise.race([live, sleep(4000)]);
   return results;
 }
 
@@ -1702,7 +1808,12 @@ async function runMonitor(){
         } catch(e){ console.error(`  [Monitor] SERCOP error (${term}):`, e.message); }
       }
     }
+    const slowDeadline = Date.now() + 8000;
     for(const term of terms){
+      if(Date.now() >= slowDeadline){
+        console.log(`  [Monitor] ${radar.nombre}: otras fuentes en pausa para no bloquear el ciclo`);
+        break;
+      }
       if(wantsSource(radar, 'undp')){
         try {
           const rows = await fetchUNDPNotices(term, radar.year);
@@ -1712,19 +1823,20 @@ async function runMonitor(){
           }
         } catch(e){ console.error(`  [Monitor] UNDP error (${term}):`, e.message); }
       }
+      if(Date.now() >= slowDeadline) break;
       if(wantsSource(radar, 'nco')){
         try {
           const {out} = await fetchNCONeeds(term, radar.year, radar.buyer);
           for(const row of out) if(row && !allResults.has(row.ocid)) allResults.set(row.ocid, row);
         } catch(e){ console.error(`  [Monitor] NCO error (${term}):`, e.message); }
       }
+      if(Date.now() >= slowDeadline) break;
       if(wantsSource(radar, 'bid')){
         try {
           const rows = await fetchBIDProjects(term, radar.year);
           for(const row of rows) if(row?.ocid && !allResults.has(row.ocid)) allResults.set(row.ocid, row);
         } catch(e){ console.error(`  [Monitor] BID error (${term}):`, e.message); }
       }
-      if(wantsSource(radar, 'undp') || wantsSource(radar, 'nco') || wantsSource(radar, 'bid')) await sleep(TERM_DELAY);
     }
     for(const cpc of cpcCodes){
       if(!wantsSource(radar, 'sercop')) continue;
@@ -1855,6 +1967,12 @@ function getBuyerLabel(row){
 }
 
 const OCDS_MODALITY_RE = /^(SIE|CPC|LICO|CE|CO|ICQ|SNCP|SGP|ICAP|CGUV|AP)-/;
+function titleLooksLikeCode(title, ocid){
+  const t = String(title || '').trim();
+  const tail = procCodeTail(ocid);
+  if(!t || t === ocid || t === tail || OCDS_MODALITY_RE.test(t)) return true;
+  return /^[A-Z0-9]{2,}(-[A-Z0-9]{2,}){1,}$/.test(t);
+}
 function procCodeTail(ocid){
   const s = String(ocid||'');
   const m = s.match(/^ocds-[^-]+-[^-]+-(.+)$/);
@@ -1879,9 +1997,7 @@ function normalizeSearchRow(row, term){
   }
   const title = String(row.title ?? '').trim();
   const desc = String(row.description ?? '').trim();
-  const tail = procCodeTail(ocid);
-  const titleIsCode = !title || title === ocid || title === tail || OCDS_MODALITY_RE.test(title);
-  if(titleIsCode && desc && desc.length > 8) row.title = desc.slice(0, 160);
+  if(titleLooksLikeCode(title, ocid) && desc && desc.length > 8) row.title = desc.slice(0, 160);
   return row;
 }
 
@@ -1926,6 +2042,27 @@ function isDismissed(radarId, ocid){
 }
 
 // Processes
+function readableProcessTitle(title, description, ocid){
+  const current = String(title || '').trim();
+  const desc = String(description || '').trim();
+  if(titleLooksLikeCode(current, ocid) && desc.length > 8) return desc.slice(0, 160);
+  return current;
+}
+
+function presentProcess(row){
+  let raw = {};
+  try { raw = row.raw_json ? JSON.parse(row.raw_json) : {}; } catch(_e) { raw = {}; }
+  const title = readableProcessTitle(raw.title || row.title, raw.description || row.description, row.ocid);
+  if(title && title !== String(raw.title || '').trim()){
+    raw.title = title;
+    raw.ocid = raw.ocid || row.ocid;
+    if(!raw.description && row.description) raw.description = row.description;
+    row.raw_json = JSON.stringify(raw);
+  }
+  if(title) row.title = title;
+  return row;
+}
+
 function getProcessesForRadar(radarId){
   const radar = dbGet("SELECT * FROM radares WHERE id=?", [radarId]);
   return dbAll(
@@ -1937,18 +2074,20 @@ function getProcessesForRadar(radarId){
     try { raw = row.raw_json ? JSON.parse(row.raw_json) : null; } catch(_e) {}
     const candidate = {...(raw || {}), ...row};
     return rowMatchesRadar(candidate, radar);
-  });
+  }).map(presentProcess);
 }
 
 function saveProcess(row, radarId){
   const radar = dbGet("SELECT * FROM radares WHERE id=?", [radarId]);
   if(!rowMatchesRadar(row, radar)) return false;
   if(isDismissed(radarId, row.ocid)) return false;
-  const existing = dbGet("SELECT radar_ids FROM procesos WHERE ocid=?", [row.ocid||'']);
+  const existing = dbGet("SELECT radar_ids, detail_json, detail_updated_at, first_seen_at FROM procesos WHERE ocid=?", [row.ocid||'']);
   let radarIds = [radarId];
   if(existing?.radar_ids) radarIds = [...new Set([...existing.radar_ids.split(','), radarId])];
-  dbRun("INSERT OR REPLACE INTO procesos(ocid, radar_ids, source, title, description, buyer_name, date, modalidad, raw_json) VALUES(?,?,?,?,?,?,?,?,?)",
-    [row.ocid, radarIds.join(','), row.source||'SERCOP', getRowTitle(row), getRowDescription(row), getBuyerLabel(row), getRowDate(row), getRowModality(row), JSON.stringify(row)]);
+  dbRun(`INSERT OR REPLACE INTO procesos(ocid, radar_ids, source, title, description, buyer_name, date, modalidad, raw_json, detail_json, detail_updated_at, first_seen_at)
+    VALUES(?,?,?,?,?,?,?,?,?,?,?, COALESCE(?, datetime('now')))`,
+    [row.ocid, radarIds.join(','), row.source||'SERCOP', getRowTitle(row), getRowDescription(row), getBuyerLabel(row), getRowDate(row), getRowModality(row), JSON.stringify(row),
+     existing?.detail_json || null, existing?.detail_updated_at || null, existing?.first_seen_at || null]);
   return true;
 }
 
@@ -2341,12 +2480,28 @@ async function handleSearch(req, res, params){
   }
 
   const totalSteps = terms.length + cpcCodes.length;
-  let ncoDownWarned = false;
 
   function publishRow(row){
     if(!row?.ocid || merged.has(row.ocid)) return;
     merged.set(row.ocid, row);
     send('result', row);
+  }
+
+  const sourceStatus = {
+    sercop: wantsSource(radar, 'sercop') ? 'sin consulta' : 'no incluida',
+    nco: wantsSource(radar, 'nco') ? 'omitida' : 'no incluida',
+    undp: wantsSource(radar, 'undp') ? 'omitida' : 'no incluida',
+    bid: wantsSource(radar, 'bid') ? 'omitida' : 'no incluida'
+  };
+  let sercopLive = false;
+  let sercopCached = false;
+  const pendingCodes = [];
+
+  function publishSercop(raw, term){
+    const row = normalizeSearchRow(raw, term);
+    if(!row) return;
+    saveProcess(row, radarId);
+    publishRow(row);
   }
 
   try {
@@ -2356,26 +2511,43 @@ async function handleSearch(req, res, params){
         const term = terms[ti];
         send('term_start', {term, index:ti, total:totalSteps});
         try {
-          const {out, truncated, totalAvailable, skipped, query} = await fetchSERCOPAllPages(term, radar.year, radar.buyer, radar.supplier, (prog) => send('progress', prog), true);
+          const {out, truncated, totalAvailable, skipped, query, codeOnly, cached} = await fetchSERCOPAllPages(term, radar.year, radar.buyer, radar.supplier, (prog) => send('progress', prog), false);
           if(skipped) send('warning', {message: sercopSkipMessage(term, skipped)});
           else warnSercopParties(query);
           if(truncated) send('warning', {message:`"${term}": mostrando primeras ${MAX_PAGES} paginas de resultados`, totalAvailable});
-          for(const raw of out){
-            const row = normalizeSearchRow(raw, term);
-            if(!row) continue;
-            saveProcess(row, radarId);
-            publishRow(row);
+          if(!skipped){
+            if(cached) sercopCached = true;
+            else sercopLive = true;
           }
+          for(const raw of out) publishSercop(raw, term);
+          for(const raw of codeOnly || []) pendingCodes.push({raw, term});
         } catch(e){
           console.error(`  SERCOP error (${term}):`, e.message);
           sourceErrors.push(`SERCOP (${term}): ${e.message}`);
+          sourceStatus.sercop = 'sin respuesta';
+        }
+      }
+      if(sercopLive) sourceStatus.sercop = 'disponible';
+      else if(sercopCached) sourceStatus.sercop = 'en caché';
+      else if(sourceStatus.sercop !== 'sin respuesta') sourceStatus.sercop = 'sin resultados';
+      if(pendingCodes.length){
+        const byTerm = new Map();
+        for(const item of pendingCodes){
+          if(!byTerm.has(item.term)) byTerm.set(item.term, []);
+          byTerm.get(item.term).push(item.raw);
+        }
+        const confirmStart = Date.now();
+        for(const [term, rows] of byTerm){
+          if(Date.now() - confirmStart > 6000) break;
+          const confirmed = await confirmCodeOnlyRows(rows, term);
+          for(const raw of confirmed) publishSercop(raw, term);
         }
       }
       for(let ci = 0; ci < cpcCodes.length; ci++){
         const cpc = cpcCodes[ci];
         send('term_start', {term:`CPC ${cpc}`, index:terms.length + ci, total:totalSteps});
         try {
-          const {out, truncated, totalAvailable, skipped, query} = await fetchSERCOPByCPC(cpc, radar.year, radar.buyer, (prog) => send('progress', prog), true);
+          const {out, truncated, totalAvailable, skipped, query} = await fetchSERCOPByCPC(cpc, radar.year, radar.buyer, (prog) => send('progress', prog), false);
           if(skipped) send('warning', {message: sercopSkipMessage(`CPC ${cpc}`, skipped)});
           else warnSercopParties(query);
           if(truncated) send('warning', {message:`"CPC ${cpc}": mostrando primeras ${MAX_PAGES} paginas de resultados`, totalAvailable});
@@ -2405,6 +2577,9 @@ async function handleSearch(req, res, params){
           if(!slowSkipped){
             slowSkipped = true;
             send('warning', {message:'Otras fuentes tardaron demasiado; se muestran los procesos de SERCOP'});
+            for(const key of ['undp','nco','bid']){
+              if(sourceStatus[key] === 'omitida' || sourceStatus[key] === 'sin consulta') sourceStatus[key] = 'en pausa';
+            }
           }
           send('term_done', {term, count: merged.size});
           continue;
@@ -2413,6 +2588,7 @@ async function handleSearch(req, res, params){
         if(wantsSource(radar, 'undp')){
           try {
             const undpRows = await fetchUNDPNotices(term, radar.year);
+            sourceStatus.undp = undpRows.length ? 'disponible' : 'sin avisos';
             for(const raw of undpRows){
               const row = normalizeSearchRow(raw, term);
               if(!row) continue;
@@ -2421,7 +2597,7 @@ async function handleSearch(req, res, params){
             }
           } catch(e){
             console.error(`  UNDP error (${term}):`, e.message);
-            sourceErrors.push(`UNDP (${term}): ${e.message}`);
+            sourceStatus.undp = 'sin respuesta';
           }
         }
 
@@ -2429,12 +2605,11 @@ async function handleSearch(req, res, params){
           try {
             const {out, totalAvailable, skipped, unavailable} = await fetchNCONeeds(term, radar.year, radar.buyer);
             if(unavailable){
-              if(!ncoDownWarned){
-                ncoDownWarned = true;
-                send('warning', {message:'NCO no responde en este momento; SERCOP y el resto de fuentes siguen'});
-              }
+              sourceStatus.nco = 'sin respuesta';
+            } else if(skipped){
+              sourceStatus.nco = 'omitida';
             } else {
-              if(skipped) send('warning', {message:`"${term}": NCO requiere minimo 5 caracteres`});
+              sourceStatus.nco = out.length ? 'disponible' : 'sin avisos';
               if(out.length && totalAvailable > out.length) send('warning', {message:`"${term}": NCO devolvio ${totalAvailable} coincidencias; mostrando ${out.length} relevantes vigentes del ano configurado`});
               for(const row of out){
                 saveProcess(row, radarId);
@@ -2444,20 +2619,21 @@ async function handleSearch(req, res, params){
             }
           } catch(e){
             console.error(`  NCO error (${term}):`, e.message);
-            sourceErrors.push(`NCO (${term}): ${e.message}`);
+            sourceStatus.nco = 'sin respuesta';
           }
         }
 
         if(wantsSource(radar, 'bid')){
           try {
             const bidRows = await fetchBIDProjects(term, radar.year);
+            sourceStatus.bid = bidRows.length ? 'disponible' : 'sin avisos';
             for(const row of bidRows){
               saveProcess(row, radarId);
               publishRow(row);
             }
           } catch(e){
             console.error(`  BID error (${term}):`, e.message);
-            sourceErrors.push(`BID (${term}): ${e.message}`);
+            sourceStatus.bid = 'sin respuesta';
           }
         }
 
@@ -2467,7 +2643,12 @@ async function handleSearch(req, res, params){
     })();
     if(slow) await Promise.race([slowWork, sleep(5000)]);
     else await slowWork;
-    if(slow && !slowFinished) send('warning', {message:'Otras fuentes tardaron demasiado; se muestran los procesos de SERCOP'});
+    if(slow && !slowFinished){
+      send('warning', {message:'Otras fuentes tardaron demasiado; se muestran los procesos de SERCOP'});
+      for(const key of ['undp','nco','bid']){
+        if(sourceStatus[key] === 'omitida' || sourceStatus[key] === 'sin consulta') sourceStatus[key] = 'en pausa';
+      }
+    }
 
     if(wantsSource(radar, 'sercop')){
       for(const cpc of cpcCodes) send('term_done', {term:`CPC ${cpc}`, count: merged.size});
@@ -2477,6 +2658,7 @@ async function handleSearch(req, res, params){
     send('done', {
       total: results.length,
       totalAvailable: results.length,
+      sources: sourceStatus,
       warnings: sourceErrors.length ? [`Errores: ${sourceErrors.join(' · ')}`] : []
     });
     streamClosed = true;
@@ -2492,7 +2674,7 @@ async function handleSearch(req, res, params){
 }
 
 // -- Detail fetch (server-side) --------------------------------------
-async function fetchDetail(ocid, force){
+async function fetchDetail(ocid, force, opts = {}){
   if(!force){
     const cached = getDetail(ocid);
     if(cached) return cached;
@@ -2516,10 +2698,14 @@ async function fetchDetail(ocid, force){
   }
   if(row?.source && String(row.source).toUpperCase() !== 'SERCOP') return null;
 
-  const resp = await fetchWithRetry(`${SERCOP_API}/record?ocid=${encodeURIComponent(ocid)}`, {headers:{'Accept':'application/json'}});
+  const resp = await fetchWithRetry(`${SERCOP_API}/record?ocid=${encodeURIComponent(ocid)}`, {
+    headers:{'Accept':'application/json'},
+    retries: opts.fast ? 0 : undefined,
+    connectTimeout: opts.fast ? 4000 : undefined
+  });
   const data = await resp.json();
   let det = mergeDetail(data);
-  if(!det.tendersCount && !det.awardsCount && !det.contractsCount){
+  if(!opts.fast && !det.tendersCount && !det.awardsCount && !det.contractsCount){
     const sib = await resolveSiblingRecord(ocid);
     if(sib && sib !== ocid){
       try{
@@ -2534,7 +2720,10 @@ async function fetchDetail(ocid, force){
             const sDesc = String(firstNonEmpty(sReleases[i]?.tender?.description, sReleases[i]?.planning?.description, sReleases[i]?.planning?.identifier?.description) ?? '').trim();
             if(sDesc){
               try{
-                dbRun("UPDATE procesos SET title=?, description=COALESCE(?, description) WHERE ocid=?", [sDesc.slice(0,200), sDesc, ocid]);
+                const current = dbGet("SELECT title FROM procesos WHERE ocid=?", [ocid]);
+                if(titleLooksLikeCode(current?.title, ocid)){
+                  dbRun("UPDATE procesos SET title=?, description=COALESCE(?, description) WHERE ocid=?", [sDesc.slice(0,200), sDesc, ocid]);
+                }
               }catch(_){}
               break;
             }

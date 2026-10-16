@@ -81,10 +81,14 @@
   input::placeholder{color:#9AA6B2;}
   select{background:var(--panel-2); border:1px solid var(--border); color:var(--text); padding:6px 8px; border-radius:5px; font-family:var(--sans); font-size:12px;}
 
-  .radar-header{display:flex; justify-content:space-between; align-items:flex-start; flex-wrap:wrap; gap:12px; margin-bottom:14px;}
+  .radar-header{display:flex; justify-content:space-between; align-items:flex-start; flex-wrap:wrap; gap:12px; margin-bottom:14px; position:sticky; top:0; z-index:4; background:var(--bg); padding-bottom:8px;}
   .radar-title{font-family:var(--display); font-size:17px; font-weight:600;}
   .radar-criteria{font-family:var(--mono); font-size:11.5px; color:var(--muted); margin-top:4px;}
   .radar-criteria span{color:var(--accent);}
+  .source-status{display:flex; flex-wrap:wrap; gap:6px; margin-top:6px;}
+  .source-status span{font-family:var(--mono); font-size:10.5px; border:1px solid var(--border); border-radius:99px; padding:2px 8px; color:var(--muted);}
+  .source-status .ok{color:var(--accent); border-color:var(--accent);}
+  .source-status .bad{color:#b4534a; border-color:#b4534a;}
 
   table{width:100%; border-collapse:collapse; font-size:12.5px;}
   thead th{text-align:left; font-family:var(--mono); font-size:10px; letter-spacing:.05em; text-transform:uppercase;
@@ -453,7 +457,7 @@
       </div>
       <div class="note">
         La API pública de SERCOP busca por <b>palabra clave</b> (mínimo 3 caracteres) en el año 2015 hasta el año en curso. Comprador y proveedor son opcionales y, si se indican, también necesitan al menos 3 caracteres. Este radar acepta <b>varios términos separados por coma</b>.
-        Para "ethical hacking" prueba algo como: <code>hacking ético, pentest, pruebas de penetración, análisis de vulnerabilidades</code>.
+        <code>pentest</code> también consulta «ethical hacking» y «pruebas de penetración»; <code>27001</code> consulta «seguridad de la información» y <code>LOPDP</code> consulta «protección de datos personales».
       </div>
     </div>
 
@@ -464,6 +468,7 @@
         <div>
           <div class="radar-title" id="rTitle"></div>
           <div class="radar-criteria" id="rCriteria"></div>
+          <div class="source-status" id="sourceStatus"></div>
         </div>
         <div class="btn-row" style="display:flex; gap:8px; flex-wrap:wrap;">
           <button class="btn btn-ghost btn-sm" id="btnRefresh" title="Re-buscar sin perder marcados">Re-buscar</button>
@@ -974,6 +979,55 @@ function partyLabel(value){
 }
 function getBuyerLabel(row){ return String(firstNonEmpty(partyLabel(row?.buyerName), partyLabel(row?.buyer_name), partyLabel(row?.buyer), partyLabel(row?.entidad), row?.buyer?.identifier?.legalName, row?.buyer?.identifier?.id, row?.buyerId) ?? '—'); }
 function getRowTitle(row){ return String(firstNonEmpty(row?.title, row?.tender?.title, row?.description, row?.ocid) ?? '—'); }
+function ocidTail(ocid){
+  const m = String(ocid || '').match(/^ocds-[^-]+-[^-]+-(.+)$/);
+  return m ? m[1] : '';
+}
+function looksLikeProcCode(value, ocid){
+  const t = String(value || '').trim();
+  if(!t || t === ocid) return true;
+  const tail = ocidTail(ocid);
+  if(tail && t === tail) return true;
+  return /^[A-Z0-9]{2,}(-[A-Z0-9]{2,}){1,}$/i.test(t);
+}
+function isBareCodeRow(row){
+  const desc = getRowDescription(row).trim();
+  if(desc.length >= 12) return false;
+  return looksLikeProcCode(String(row?.title || '').trim(), row?.ocid);
+}
+function preliminarySources(radar, state){
+  const src = String(radar?.source || 'sercop').toLowerCase();
+  const wants = (key) => {
+    if(src === 'todas') return true;
+    if(key === 'sercop') return src === 'sercop' || src === 'ambos';
+    if(key === 'bid') return src === 'bid' || src === 'ambos';
+    return src === key;
+  };
+  const sources = {};
+  for(const key of ['sercop','nco','undp','bid']) sources[key] = wants(key) ? state : 'no incluida';
+  return sources;
+}
+function displayTitle(row){
+  const title = getRowTitle(row);
+  const desc = getRowDescription(row);
+  if(looksLikeProcCode(title, row?.ocid) && desc.length > 8) return desc.slice(0, 160);
+  return title;
+}
+function renderSourceStatus(sources){
+  const el = $('sourceStatus');
+  if(!el) return;
+  if(!sources){ el.innerHTML = ''; return; }
+  const labels = {sercop:'SERCOP', nco:'NCO', undp:'PNUD', bid:'BID'};
+  el.innerHTML = Object.entries(labels)
+    .filter(([key]) => sources[key] && sources[key] !== 'no incluida')
+    .map(([key, label]) => {
+      const state = String(sources[key]);
+      const bad = /sin respuesta|error/.test(state);
+      const pending = /consultando|sin consulta|omitida|en pausa/.test(state);
+      const cls = bad ? 'bad' : pending ? '' : 'ok';
+      return `<span class="${cls}">${esc(label)}: ${esc(state)}</span>`;
+    }).join('');
+}
 function getRowDescription(row){ return String(firstNonEmpty(row?.description, row?.tender?.description) ?? ''); }
 function getRowDate(row){ return String(firstNonEmpty(row?.datePublished, row?.publishedDate, row?.releaseDate, row?.date, row?.tender?.datePublished, row?.tender?.tenderPeriod?.startDate) ?? ''); }
 function getRowModality(row){ return String(firstNonEmpty(row?.internal_type, row?.procurementMethodDetails, row?.tender?.procurementMethodDetails, row?.tender?.procurementMethod, row?.method) ?? '—'); }
@@ -1713,6 +1767,7 @@ async function doSearch(){
   $('btnRefresh').disabled = true;
   $('btnLoadAll').disabled = true;
   $('countText').textContent = 'cargando…';
+  renderSourceStatus(preliminarySources(r, 'consultando…'));
 
   const merged = new Map();
   const warnings = [];
@@ -1723,7 +1778,10 @@ async function doSearch(){
       if(myToken !== searchToken || S.activeRadarId !== searchRadarId) return;
       if(saved && saved.length){
         saved.forEach(row => {
-          try{ const p = JSON.parse(row.raw_json); if(p?.ocid) merged.set(p.ocid, p); }catch(_){}
+          try{
+            const p = JSON.parse(row.raw_json);
+            if(p?.ocid && !isBareCodeRow(p)) merged.set(p.ocid, p);
+          }catch(_){}
         });
         S.allResults = [...merged.values()].sort((a,b) => String(getRowDate(b)).localeCompare(String(getRowDate(a))));
         S.currentTotal = S.allResults.length;
@@ -1750,8 +1808,17 @@ async function doSearch(){
           if(myToken !== searchToken || S.activeRadarId !== searchRadarId) return;
           if(event === 'term_start'){
             $('countText').textContent = `buscando "${data.term}" (${data.index+1}/${data.total})…`;
-          } else if(event === 'result' && data?.ocid && !merged.has(data.ocid)){
-            merged.set(data.ocid, data);
+          } else if(event === 'result' && data?.ocid){
+            if(isBareCodeRow(data)) return;
+            const prev = merged.get(data.ocid);
+            if(prev){
+              if(data.title && !looksLikeProcCode(data.title, data.ocid)) prev.title = data.title;
+              if(data.description && String(data.description).length > String(prev.description || '').length) prev.description = data.description;
+              if(data.buyerName) prev.buyerName = data.buyerName;
+              merged.set(data.ocid, prev);
+            } else {
+              merged.set(data.ocid, data);
+            }
             S.allResults = [...merged.values()].sort((a,b) => String(getRowDate(b)).localeCompare(String(getRowDate(a))));
             S.currentTotal = S.allResults.length;
             S.currentPages = Math.max(1, Math.ceil(S.currentTotal / PAGE_SIZE));
@@ -1775,6 +1842,7 @@ async function doSearch(){
             S.allResults = [...merged.values()].sort((a,b) => String(getRowDate(b)).localeCompare(String(getRowDate(a))));
             S.currentTotal = S.allResults.length;
             S.currentPages = Math.max(1, Math.ceil(S.currentTotal / PAGE_SIZE));
+            renderSourceStatus(data.sources);
             if(data.warnings?.length){
               const msg = data.warnings.join(' ');
               if(merged.size) toast(msg, 'warning', 6000);
@@ -1919,8 +1987,9 @@ function render(){
   S.currentResults.forEach((row, i) => {
     const isNew = !S.seenSet.has(row.ocid);
     const buyerLabel = getBuyerLabel(row);
-    const rowTitle = getRowTitle(row);
-    const rowDesc = getRowDescription(row);
+    const rowTitle = displayTitle(row);
+    const rowDescRaw = getRowDescription(row);
+    const rowDesc = rowDescRaw && rowTitle !== rowDescRaw.slice(0, rowTitle.length) ? rowDescRaw : '';
     const rowDate = getRowDate(row);
     const rowModality = getRowModality(row);
     const publication = publicationInfo(rowDate);
@@ -2330,6 +2399,12 @@ function paintDetail(ocid){
   }
   const matchCell = tr.querySelector('.cell-match');
   if(matchCell && rrow) matchCell.innerHTML = `<div class="match-reason">${esc(matchReason(rrow))}</div>`;
+  if(rrow){
+    const itemDesc = (d.items || []).map(it => it?.description || it?.name).find(t => t && String(t).length > 12) || '';
+    if(itemDesc && looksLikeProcCode(getRowTitle(rrow), rrow.ocid)) rrow.title = String(itemDesc).slice(0, 160);
+    const titleSpan = tr.querySelector('.title-cell > span');
+    if(titleSpan) titleSpan.textContent = displayTitle(rrow);
+  }
   const docCell = tr.querySelector('.cell-doc');
   if(docCell) docCell.innerHTML = d.docs?.length ? `<a class="ext" href="${esc(safeHref(d.docs[0].url))}" target="_blank" rel="noopener noreferrer" data-stop>ver (${esc(d.docs.length)})</a>` : '—';
   renderStats();

@@ -506,6 +506,7 @@ describe('Server API', () => {
     assert.equal(warnings.includes('fetch failed'), false, warnings);
     assert.equal(/conexión fallida|HTTP 429/.test(warnings), false, warnings);
     assert.ok(done.data.total > 0, 'SERCOP debe devolver procesos para esas palabras');
+    assert.equal(typeof done.data.sources?.sercop, 'string');
     const rows = events.filter(e => e.event === 'result').map(e => e.data);
     assert.ok(rows.some(row => row && row.buyerName && row.buyerName !== '—'), 'search_ocds trae la entidad en buyer o buyerName');
     const deleted = await api(`/api/radares/${id}`, {method:'DELETE'});
@@ -529,6 +530,13 @@ describe('Server API', () => {
     const blob = rows.map(row => [row?.buyerName, row?.title, row?.description, row?.ocid].filter(Boolean).join(' ')).join('\n');
     assert.match(blob, /Yachay|LOPDP/i);
     assert.match(blob, /EL[EÉ]CTRICA QUITO|AGUAPEN|HACKING/i);
+    assert.equal(typeof done.data.sources?.sercop, 'string');
+    const eeq = rows.find(row => /EEQ|EL[EÉ]CTRICA QUITO/i.test([row?.buyerName, row?.ocid].join(' ')));
+    if(eeq) assert.doesNotMatch(String(eeq.title || ''), /^LICS-EEQ-/, 'el título visible debe ser el objeto del proceso');
+    for(const row of rows){
+      const desc = String(row?.description || '').trim();
+      if(desc.length < 12) assert.doesNotMatch(String(row?.title || ''), /^[A-Z0-9]{2,}(-[A-Z0-9]{2,}){1,}$/i, row?.ocid);
+    }
     const firstResult = r.body.indexOf('event: result');
     const firstSlow = r.body.search(/event: warning|NCO error|UNDP error/);
     assert.ok(firstResult > 0, 'debe haber eventos result');
@@ -536,6 +544,45 @@ describe('Server API', () => {
     const saved = await api(`/api/radares/${encodeURIComponent(id)}/results`);
     assert.equal(saved.status, 200);
     assert.ok(saved.json().length >= 2, 'los procesos deben quedar guardados en el radar');
+    const deleted = await api(`/api/radares/${id}`, {method:'DELETE'});
+    assert.equal(deleted.status, 200);
+  });
+
+  it('27001 no toma el número interno del proceso como si fuera la norma', {timeout: 120000}, async () => {
+    const id = 'r_iso_live';
+    const created = await api('/api/radares', {method:'POST', body:{
+      id, nombre:'ISO', year:2026, source:'sercop', buyer:'', supplier:'',
+      search:'27001'
+    }});
+    assert.equal(created.status, 201);
+    const r = await apiStream(`/api/search?radarId=${encodeURIComponent(id)}`);
+    assert.equal(r.status, 200);
+    const events = parseSSE(r.body);
+    const done = events.find(e => e.event === 'done');
+    assert.ok(done, 'la búsqueda debe emitir done');
+    const rows = events.filter(e => e.event === 'result').map(e => e.data);
+    assert.equal(rows.some(row => String(row?.ocid || '').includes('MDMQ-2026-27001')), false, 'el código SIE-MDMQ-2026-27001 es una compra de medicamentos');
+    const blob = rows.map(row => [row?.title, row?.description].join(' ')).join('\n');
+    assert.match(blob, /27001|seguridad de la informaci[oó]n/i);
+    const deleted = await api(`/api/radares/${id}`, {method:'DELETE'});
+    assert.equal(deleted.status, 200);
+  });
+
+  it('pentest consulta el sinónimo ethical hacking en SERCOP', {timeout: 120000}, async () => {
+    const id = 'r_pentest_live';
+    const created = await api('/api/radares', {method:'POST', body:{
+      id, nombre:'Pentest', year:2026, source:'sercop', buyer:'', supplier:'',
+      search:'pentest'
+    }});
+    assert.equal(created.status, 201);
+    const r = await apiStream(`/api/search?radarId=${encodeURIComponent(id)}`);
+    assert.equal(r.status, 200);
+    const events = parseSSE(r.body);
+    const done = events.find(e => e.event === 'done');
+    assert.ok(done, 'la búsqueda debe emitir done');
+    assert.ok(done.data.total > 0, 'pentest debe encontrar procesos por sinónimo');
+    const blob = events.filter(e => e.event === 'result').map(e => [e.data?.title, e.data?.description, e.data?.buyerName].join(' ')).join('\n');
+    assert.match(blob, /hack|vulnerab|penetr/i);
     const deleted = await api(`/api/radares/${id}`, {method:'DELETE'});
     assert.equal(deleted.status, 200);
   });
