@@ -79,6 +79,7 @@ function initSchema(db){
     pass_hash TEXT NOT NULL,
     role TEXT NOT NULL DEFAULT 'admin',
     disabled INTEGER NOT NULL DEFAULT 0,
+    claimed INTEGER NOT NULL DEFAULT 0,
     created_at TEXT DEFAULT (datetime('now')),
     updated_at TEXT DEFAULT (datetime('now')),
     password_changed_at TEXT DEFAULT (datetime('now')))`);
@@ -105,9 +106,20 @@ function initSchema(db){
     bucket TEXT NOT NULL,
     updated_ms INTEGER NOT NULL,
     PRIMARY KEY(limiter, key))`);
+  // Sobrevive al borrado de login_events (30 días). Si vale 1, la clave ya
+  // se usó o se definió a propósito y un despliegue nuevo no la descarta.
+  db.exec(`CREATE TABLE IF NOT EXISTS auth_state(
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL)`);
   db.exec('CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id)');
   db.exec('CREATE INDEX IF NOT EXISTS idx_login_events_created ON login_events(created_at)');
   db.exec('CREATE INDEX IF NOT EXISTS idx_rate_limits_updated ON rate_limits(updated_ms)');
+  try{
+    const cols = db.prepare('PRAGMA table_info(users)').all();
+    if(!cols.some(c => c.name === 'claimed')){
+      db.exec('ALTER TABLE users ADD COLUMN claimed INTEGER NOT NULL DEFAULT 0');
+    }
+  }catch(_){}
   try{ db.prepare("DELETE FROM login_events WHERE created_at < datetime('now','-30 days')").run(); }catch(_){}
   try{ db.prepare("DELETE FROM sessions WHERE expires_at < datetime('now')").run(); }catch(_){}
   try{ db.prepare('DELETE FROM rate_limits WHERE updated_ms < ?').run(Date.now() - 24 * 60 * 60 * 1000); }catch(_){}
@@ -127,21 +139,72 @@ function getUserById(db, id){
   return db.prepare('SELECT * FROM users WHERE id = ?').get(Number(id)) || null;
 }
 
-async function createUser(db, username, password, role = 'admin'){
+async function createUser(db, username, password, role = 'admin', opts = {}){
   const user = String(username || '').trim();
   if(!user) throw new Error('usuario requerido');
   if(String(password || '').length < MIN_PASSWORD_LEN) throw new Error(`la contraseña debe tener al menos ${MIN_PASSWORD_LEN} caracteres`);
   const passHash = await hashPassword(password);
-  db.prepare('INSERT INTO users(username, pass_hash, role) VALUES(?,?,?)').run(user, passHash, role);
+  const claimed = opts.claimed === false ? 0 : 1;
+  db.prepare('INSERT INTO users(username, pass_hash, role, claimed) VALUES(?,?,?,?)').run(user, passHash, role, claimed);
   return getUserByName(db, user);
+}
+
+// Crea el primer administrador solo si la tabla sigue vacía. El hash ya está
+// calculado para no hacer scrypt dentro de la transacción.
+function claimFirstAdmin(db, username, passHash, role = 'admin'){
+  const user = String(username || '').trim();
+  if(!user) throw new Error('usuario requerido');
+  if(!/^[A-Za-z0-9._-]{1,64}$/.test(user)) throw new Error('usuario inválido');
+  const insert = db.transaction(() => {
+    const n = Number(db.prepare('SELECT COUNT(*) AS n FROM users').get().n);
+    if(n > 0) return null;
+    db.prepare('INSERT INTO users(username, pass_hash, role, claimed) VALUES(?,?,?,1)').run(user, passHash, role);
+    return db.prepare('SELECT * FROM users WHERE username = ?').get(user);
+  });
+  return insert();
 }
 
 async function setPassword(db, userId, password){
   if(String(password || '').length < MIN_PASSWORD_LEN) throw new Error(`la contraseña debe tener al menos ${MIN_PASSWORD_LEN} caracteres`);
   const passHash = await hashPassword(password);
-  db.prepare("UPDATE users SET pass_hash=?, updated_at=datetime('now'), password_changed_at=datetime('now') WHERE id=?").run(passHash, Number(userId));
+  db.prepare("UPDATE users SET pass_hash=?, claimed=1, updated_at=datetime('now'), password_changed_at=datetime('now') WHERE id=?").run(passHash, Number(userId));
   // Invalida todas las sesiones previas del usuario salvo la que se recreará.
   db.prepare('DELETE FROM sessions WHERE user_id=?').run(Number(userId));
+  markAuthEstablished(db);
+}
+
+function markUserClaimed(db, userId){
+  db.prepare('UPDATE users SET claimed=1 WHERE id=?').run(Number(userId));
+}
+
+function markAllClaimed(db){
+  db.prepare('UPDATE users SET claimed=1 WHERE claimed=0').run();
+}
+
+function hasClaimedUser(db){
+  const row = db.prepare('SELECT COUNT(*) AS n FROM users WHERE claimed=1').get();
+  return !!(row && Number(row.n) > 0);
+}
+
+function hasSuccessfulLogin(db){
+  const row = db.prepare('SELECT COUNT(*) AS n FROM login_events WHERE ok=1').get();
+  return !!(row && Number(row.n) > 0);
+}
+
+function markAuthEstablished(db){
+  db.prepare(`INSERT INTO auth_state(key, value) VALUES('established','1')
+    ON CONFLICT(key) DO UPDATE SET value='1'`).run();
+}
+
+function isAuthEstablished(db){
+  const row = db.prepare("SELECT value FROM auth_state WHERE key='established'").get();
+  return !!(row && row.value === '1');
+}
+
+// Quita usuarios y sesiones. No toca radares, procesos ni el resto de la BD.
+function clearCredentials(db){
+  db.exec('DELETE FROM sessions');
+  db.exec('DELETE FROM users');
 }
 
 // ── Sesiones ────────────────────────────────────────────────────────────────
@@ -320,7 +383,15 @@ module.exports = {
   getUserByName,
   getUserById,
   createUser,
+  claimFirstAdmin,
   setPassword,
+  markUserClaimed,
+  markAllClaimed,
+  hasClaimedUser,
+  hasSuccessfulLogin,
+  markAuthEstablished,
+  isAuthEstablished,
+  clearCredentials,
   authenticate,
   createSession,
   getSession,

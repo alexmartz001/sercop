@@ -24,9 +24,11 @@ cp .env.example .env      # ajusta los valores
 npm start                 # node server.js
 ```
 
-En el primer arranque, si no defines `NVG_AUTH_PASS`, se **genera una
-contraseña aleatoria y se imprime una sola vez** en la consola. Guárdala y
-cámbiala desde el panel (menú de usuario → cambiar contraseña).
+En el primer arranque, si no defines `NVG_AUTH_PASS` (mínimo 10 caracteres),
+**no se genera una contraseña oculta**. Abre `/login` y define la del
+administrador. Si un despliegue anterior había creado una clave que nadie
+llegó a usar, ese arranque también abre `/login` para definirla; los radares
+y el resto de la base se conservan.
 
 Desarrollo sin autenticación (¡no exponer a Internet!):
 
@@ -52,7 +54,9 @@ en «Verificado» y muestra «El enrutamiento del dominio necesita atención».
    y no hay `NVG_HOST`, el servidor escucha en `0.0.0.0` en ese puerto.
 2. El edge **debe reenviar** `X-Forwarded-For` y `X-Forwarded-Proto: https`.
    Con eso se activan automáticamente la cookie `Secure` y HSTS.
-3. Define **`NVG_AUTH_PASS`** como secreto de la plataforma (mínimo 10 caracteres).
+3. Define **`NVG_AUTH_PASS`** como secreto de la plataforma (mínimo 10 caracteres)
+   o déjalo vacío y crea la clave en `/login` al abrir el sitio. Una clave más
+   corta se ignora: el proceso no inventa otra ni la imprime en los logs.
 4. **Persistencia**: `NVG_DB=/app/data/radar.db` con el volumen
    `radar-data:/app/data`. El proceso crea el directorio si el volumen aún no
    está montado, para no morir antes de escuchar.

@@ -2426,6 +2426,8 @@ async function handleLogin(req, res){
   loginIpLimiter.reset(ip);
   loginUserLimiter.reset(userKey);
   auth.recordLoginEvent(db, user.username, ip, true);
+  auth.markAuthEstablished(db);
+  auth.markUserClaimed(db, user.id);
   const {token, csrf, expiresAt} = auth.createSession(db, user.id, {
     ip, userAgent: req.headers['user-agent'] || '', ttlMs: SESSION_TTL_MS
   });
@@ -2440,8 +2442,8 @@ async function handleChangePassword(req, res, authResult){
   let body;
   try{ body = JSON.parse((await collectBody(req)).toString('utf8') || '{}'); }
   catch(e){ return json(res, 400, {error:'cuerpo inválido'}); }
-  const current = String(body.currentPassword || '');
-  const next = String(body.newPassword || '');
+  const current = String(body.currentPassword ?? body.current ?? '');
+  const next = String(body.newPassword ?? body.next ?? '');
   const user = auth.getUserById(db, authResult.user.id);
   if(!user) return json(res, 401, {error:'no autorizado'});
   if(!(await auth.verifyPassword(current, user.pass_hash))) return json(res, 400, {error:'contraseña actual incorrecta'});
@@ -2474,10 +2476,16 @@ const server = http.createServer(async (req, res) => {
     if(pathname === '/api/auth/login' && req.method === 'POST'){
       return await handleLogin(req, res);
     }
+    if(pathname === '/api/auth/setup' && req.method === 'POST'){
+      return await handleSetup(req, res);
+    }
     if(pathname === '/api/auth/session' && req.method === 'GET'){
       const a = authenticate(req, params);
-      if(!a.ok) return json(res, 200, {authenticated:false});
-      return json(res, 200, {authenticated:true, user:a.user, csrf:a.csrf || null, authDisabled: a.via === 'disabled'});
+      if(!a.ok){
+        const pending = setupRequired();
+        return json(res, 200, {authenticated:false, setupRequired: pending, suggestedUsername: pending ? AUTH_USER : undefined});
+      }
+      return json(res, 200, {authenticated:true, setupRequired:false, user:a.user, csrf:a.csrf || null, authDisabled: a.via === 'disabled'});
     }
 
     // -- Limitador global de API ----------------------------------
@@ -2942,39 +2950,94 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
-// Bootstrap de credenciales. Si no hay usuarios y no se definió NVG_AUTH_PASS,
-// se genera una contraseña aleatoria y se muestra UNA vez en la consola.
+function setupRequired(){
+  return AUTH_ENABLED && auth.countUsers(db) === 0;
+}
+
+// Primer acceso: quien abre /login define la contraseña. No se inventa una
+// clave que solo aparecería en la consola del contenedor.
+async function handleSetup(req, res){
+  if(!AUTH_ENABLED) return json(res, 400, {error:'la autenticación está desactivada'});
+  const ip = clientIp(req);
+  const ipRl = loginIpLimiter.hit(ip);
+  if(!ipRl.allowed){
+    res.setHeader('Retry-After', String(Math.ceil(ipRl.retryAfterMs / 1000)));
+    return json(res, 429, {error:'demasiados intentos, espera un momento', retryAfterMs: ipRl.retryAfterMs});
+  }
+  if(!setupRequired()) return json(res, 409, {error:'el acceso ya está definido'});
+  let body;
+  try{ body = JSON.parse((await collectBody(req)).toString('utf8') || '{}'); }
+  catch(e){ return json(res, 400, {error:'cuerpo inválido'}); }
+  const username = String(body.username || AUTH_USER).trim().slice(0, 64);
+  const password = String(body.password || '');
+  const confirm = String(body.passwordConfirm ?? body.confirm ?? '');
+  if(!username || !password) return json(res, 400, {error:'usuario y contraseña requeridos'});
+  if(password !== confirm) return json(res, 400, {error:'las contraseñas no coinciden'});
+  if(password.length < auth.MIN_PASSWORD_LEN) return json(res, 400, {error:`la contraseña debe tener al menos ${auth.MIN_PASSWORD_LEN} caracteres`});
+  let passHash;
+  try{ passHash = await auth.hashPassword(password); }
+  catch(e){ return json(res, 400, {error:'no se pudo guardar la contraseña'}); }
+  let user;
+  try{ user = auth.claimFirstAdmin(db, username, passHash, 'admin'); }
+  catch(e){ return json(res, 400, {error: e.message || 'no se pudo crear el usuario'}); }
+  if(!user) return json(res, 409, {error:'el acceso ya está definido'});
+  loginIpLimiter.reset(ip);
+  auth.markAuthEstablished(db);
+  auth.recordLoginEvent(db, user.username, ip, true);
+  const {token, csrf, expiresAt} = auth.createSession(db, user.id, {
+    ip, userAgent: req.headers['user-agent'] || '', ttlMs: SESSION_TTL_MS
+  });
+  setSessionCookie(req, res, token, SESSION_TTL_MS);
+  console.log(`  [Auth] acceso inicial creado usuario="${user.username}" ip=${ip}`);
+  return json(res, 200, {ok:true, user:{id:user.id, username:user.username, role:user.role}, csrf, expiresAt});
+}
+
+// Bootstrap de credenciales. NVG_AUTH_PASS (mínimo 10) fija la clave. Si no
+// hay una clave válida y nadie llegó a entrar, /login pide definirla: un
+// despliegue nuevo no genera ni esconde otra contraseña.
 async function bootstrapAuth(){
   if(!AUTH_ENABLED){
     console.warn('  ⚠  AUTENTICACIÓN DESACTIVADA (NVG_AUTH=off). No expongas esto a Internet.');
     return;
   }
+  const configured = String(AUTH_PASS || '');
+  const valid = configured.length >= auth.MIN_PASSWORD_LEN;
+  if(configured && !valid){
+    console.warn(`  NVG_AUTH_PASS tiene menos de ${auth.MIN_PASSWORD_LEN} caracteres. No se aplicó y no se generó otra clave.`);
+  }
+  if(auth.hasSuccessfulLogin(db)){
+    auth.markAuthEstablished(db);
+    auth.markAllClaimed(db);
+  }
+
   if(auth.countUsers(db) === 0){
-    let password = AUTH_PASS;
-    if(!password || password.length < auth.MIN_PASSWORD_LEN){
-      if(password){
-        console.warn(`  NVG_AUTH_PASS tiene menos de ${auth.MIN_PASSWORD_LEN} caracteres; se genera una contraseña temporal.`);
-      }
-      password = auth.randomToken(18).replace(/[-_]/g, '');
-    }
-    await auth.createUser(db, AUTH_USER, password, 'admin');
-    if(AUTH_PASS){
+    if(valid){
+      await auth.createUser(db, AUTH_USER, configured, 'admin');
+      auth.markAuthEstablished(db);
       console.log(`  Autenticación: usuario "${AUTH_USER}" creado desde NVG_AUTH_PASS.`);
     } else {
-      console.log('\n  ┌──────────────────────────────────────────────────────────┐');
-      console.log('  │  Usuario y contraseña iniciales (cámbialos al entrar)     │');
-      console.log('  └──────────────────────────────────────────────────────────┘');
-      console.log(`     Usuario:    ${AUTH_USER}`);
-      console.log(`     Contraseña: ${password}`);
-      console.log('     Guárdala ahora: no se volverá a mostrar.\n');
+      console.log(`  Autenticación: no hay clave. Abre /login y define la del administrador (usuario sugerido: ${AUTH_USER}).`);
     }
-  } else if(AUTH_PASS){
-    // Permite fijar/rotar la contraseña del administrador por entorno.
+    return;
+  }
+
+  if(valid){
     const existing = auth.getUserByName(db, AUTH_USER);
-    if(existing && !(await auth.verifyPassword(AUTH_PASS, existing.pass_hash))){
-      await auth.setPassword(db, existing.id, AUTH_PASS);
+    if(existing && !(await auth.verifyPassword(configured, existing.pass_hash))){
+      await auth.setPassword(db, existing.id, configured);
       console.log(`  Autenticación: contraseña de "${AUTH_USER}" actualizada desde NVG_AUTH_PASS.`);
+    } else if(existing){
+      auth.markAuthEstablished(db);
+      auth.markUserClaimed(db, existing.id);
     }
+    return;
+  }
+
+  if(!auth.isAuthEstablished(db)){
+    const n = auth.countUsers(db);
+    auth.clearCredentials(db);
+    console.log(`  Autenticación: se descartó la clave de ${n} usuario(s) porque nadie llegó a entrar y este despliegue no trae NVG_AUTH_PASS válida.`);
+    console.log(`  No se generó una clave nueva. Abre /login para definirla (usuario sugerido: ${AUTH_USER}). Los datos del radar se mantienen.`);
   }
 }
 

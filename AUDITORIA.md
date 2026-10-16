@@ -79,9 +79,10 @@ Severidad: Crítico / Alto / Medio / Bajo · Estado: ✅ Remediado · 🟡 Mitig
   petición es HTTPS (o si `NVG_SECURE_COOKIES=1`).
 - **CSRF** por sesión: las mutaciones (POST/PUT/DELETE) con sesión requieren la
   cabecera `X-CSRF-Token`.
-- **Bootstrap** en el primer arranque: si no hay usuarios, crea el admin desde
-  `NVG_AUTH_USER`/`NVG_AUTH_PASS`, o **genera una contraseña aleatoria y la
-  muestra una sola vez** en la consola.
+- **Bootstrap** en el primer arranque: si `NVG_AUTH_PASS` tiene al menos 10
+  caracteres, crea o actualiza el admin con esa clave. Si no hay clave válida
+  y nadie llegó a entrar, **`/login` pide definirla**; no se genera una
+  contraseña que solo saldría en la consola.
 - Endpoints: `POST /api/auth/login`, `POST /api/auth/logout`,
   `GET /api/auth/session`, `POST /api/auth/change-password`.
 
@@ -166,7 +167,7 @@ Ver `.env.example`. Variables principales:
 |----------|-------------|-------------|
 | `NVG_AUTH` | `on` | `off` desactiva la autenticación (solo desarrollo). |
 | `NVG_AUTH_USER` | `admin` | Usuario administrador. |
-| `NVG_AUTH_PASS` | *(vacío)* | Contraseña (mín. 10). Si se define, se fija/rota al arrancar. |
+| `NVG_AUTH_PASS` | *(vacío)* | Contraseña (mín. 10). Si se define, se fija/rota al arrancar. Si falta o es corta, `/login` pide definirla y no se genera otra. |
 | `NVG_SESSION_HOURS` | `12` | Duración de la sesión. |
 | `NVG_RATE_LIMIT_PER_MIN` | `240` | Peticiones API/minuto por IP. |
 | `NVG_MAX_JSON_MB` | `4` | Tope de cuerpo JSON. |
@@ -204,8 +205,9 @@ Ver `.env.example`. Variables principales:
 1. **Escucha detrás del proxy**: `NVG_HOST=0.0.0.0`.
 2. El edge **debe reenviar** `X-Forwarded-For` y `X-Forwarded-Proto: https`.
    Con eso se activan la cookie `Secure` y HSTS automáticamente.
-3. Define **`NVG_AUTH_PASS`** como secreto en la plataforma (o toma la contraseña
-   generada del primer arranque) y **cámbiala** desde el panel tras entrar.
+3. Define **`NVG_AUTH_PASS`** como secreto en la plataforma (mínimo 10) o crea
+   la clave en `/login` la primera vez. El arranque no imprime una contraseña
+   nueva.
 4. **Persistencia**: `NVG_DB` debe apuntar a un volumen persistente.
 5. No subas al despliegue `*.db`, `*.log` ni `.env` (ya están en `.gitignore`).
 6. Healthcheck sugerido: `GET /api/auth/session` (público, siempre responde).
@@ -243,7 +245,7 @@ cabeceras. Si el proxy no impone límites de cuerpo/tiempo, considéralo.
 npm test
 ```
 
-Resultado: **68/68 pruebas OK**, incluyendo:
+Resultado: **75/75 pruebas OK**, incluyendo:
 - suite de API sin autenticación (`NVG_AUTH=off`),
 - compatibilidad con token (`NVG_TOKEN`),
 - sesión: login correcto/incorrecto, cookie endurecida, CSRF, cabeceras de
