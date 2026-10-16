@@ -1967,12 +1967,16 @@ function savePipelineEntry(ocid, p, user){
     : (prev ? (prev.monto_oferta_num ?? parseMoney(prev.monto_oferta)) : parseMoney(montoOferta));
   const ownerId = p.ownerId !== undefined ? (Number.isFinite(Number(p.ownerId)) ? Number(p.ownerId) : null)
     : (prev ? prev.owner_id : null);
+  const statusChanged = !prev || prev.status !== status;
   const probInput = p.probabilidad !== undefined ? clampProb(p.probabilidad)
-    : (prev ? prev.probabilidad : null);
+    : (!statusChanged && prev ? prev.probabilidad : null);
   const probabilidad = probInput != null ? probInput : (PROBABILIDAD_BY_STATUS[status] ?? null);
 
-  dbRun(`INSERT INTO pipeline(ocid, status, notas, entidad, titulo, modalidad, etapa_label, valor, cierre, publicado, actualizado, cpcs, etiquetas, source, fecha_presentacion, monto_oferta, competidores, contacto, valor_num, monto_oferta_num, owner_id, probabilidad)
-    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+  const snapshot = p.snapshot !== undefined ? p.snapshot : (prev ? prev.snapshot : null);
+  const snapshotAt = p.snapshotAt !== undefined ? p.snapshotAt : (prev ? prev.snapshot_at : null);
+
+  dbRun(`INSERT INTO pipeline(ocid, status, notas, entidad, titulo, modalidad, etapa_label, valor, cierre, publicado, actualizado, cpcs, etiquetas, source, fecha_presentacion, monto_oferta, competidores, contacto, valor_num, monto_oferta_num, owner_id, probabilidad, snapshot, snapshot_at)
+    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
     ON CONFLICT(ocid) DO UPDATE SET
       status=excluded.status, notas=excluded.notas, entidad=excluded.entidad, titulo=excluded.titulo,
       modalidad=excluded.modalidad, etapa_label=excluded.etapa_label, valor=excluded.valor, cierre=excluded.cierre,
@@ -1981,10 +1985,10 @@ function savePipelineEntry(ocid, p, user){
       competidores=excluded.competidores, contacto=excluded.contacto,
       valor_num=excluded.valor_num, monto_oferta_num=excluded.monto_oferta_num,
       owner_id=excluded.owner_id, probabilidad=excluded.probabilidad,
-      snapshot=COALESCE(excluded.snapshot, pipeline.snapshot), snapshot_at=COALESCE(excluded.snapshot_at, pipeline.snapshot_at)`,
+      snapshot=excluded.snapshot, snapshot_at=excluded.snapshot_at`,
     [ocid, status, notas, entidad, titulo, modalidad, etapaLabel, valor, cierre, publicado, actualizado,
      cpcs, etiquetas, source, fechaPresentacion, montoOferta, competidores, contacto,
-     valorNum, montoOfertaNum, ownerId, probabilidad]);
+     valorNum, montoOfertaNum, ownerId, probabilidad, snapshot, snapshotAt]);
 
   if(prev){
     logPipelineHistory(ocid, 'status', prev.status, status, user);
@@ -2079,8 +2083,8 @@ async function detectPipelineChanges(force){
           changedList.push({ ocid: r.ocid, summary, entidad: proc?.entidad || '' });
         }
         dbRun(`UPDATE pipeline SET cierre=COALESCE(?,cierre), etapa_label=COALESCE(?,etapa_label),
-          valor=COALESCE(?,valor), actualizado=datetime('now'), snapshot=?, snapshot_at=datetime('now') WHERE ocid=?`,
-          [snap.closeDate || null, snap.stageLabel || null, fmtAmt(snap.valueAmount) || null, JSON.stringify(snap), r.ocid]);
+          valor=COALESCE(?,valor), valor_num=COALESCE(?,valor_num), actualizado=datetime('now'), snapshot=?, snapshot_at=datetime('now') WHERE ocid=?`,
+          [snap.closeDate || null, snap.stageLabel || null, fmtAmt(snap.valueAmount) || null, snap.valueAmount ?? null, JSON.stringify(snap), r.ocid]);
       } else {
         dbRun("UPDATE pipeline SET snapshot=?, snapshot_at=datetime('now') WHERE ocid=?", [JSON.stringify(snap), r.ocid]);
       }
@@ -2623,6 +2627,13 @@ const server = http.createServer(async (req, res) => {
       return await handleChangePassword(req, res, authResult);
     }
 
+    // -- Usuarios del equipo (responsables del pipeline) ----------
+    if(pathname === '/api/users' && req.method === 'GET'){
+      let users = [];
+      try { users = dbAll("SELECT id, username, role FROM users ORDER BY username"); } catch(_){}
+      return json(res, 200, users);
+    }
+
     // -- Static files --
     if(pathname === '/' || pathname === '/sercop.html'){
       return serveFile(res, path.join(__dirname, 'sercop.html'), nonce);
@@ -2786,8 +2797,11 @@ const server = http.createServer(async (req, res) => {
       const ocid = decodeURIComponent(pipelineMatch[1]);
       if(req.method === 'POST'){
         const body = JSON.parse(await collectBody(req));
-        savePipelineEntry(ocid, body);
-        return json(res, 200, {ok:true});
+        const saved = savePipelineEntry(ocid, body, (authResult.user && authResult.user.username) || '');
+        return json(res, 200, {ok:true, ...saved});
+      }
+      if(req.method === 'GET'){
+        return json(res, 200, getPipelineHistory(ocid, params.limit));
       }
       if(req.method === 'DELETE'){
         deletePipelineEntry(ocid);
