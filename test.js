@@ -238,6 +238,50 @@ describe('Server API', () => {
     assert.equal(typeof d.changed, 'number');
   });
 
+  // -- Sprint 1 CRM: merge preservante, parseo monetario, probabilidad e historial --
+  describe('CRM pipeline (Sprint 1)', () => {
+    const OC = 'oc-crm-s1';
+    it('parsea valor monetario y deriva probabilidad del estado', async () => {
+      const r = await api(`/api/pipeline/${OC}`, {method:'POST', body:{status:'Preparando oferta', entidad:'E', titulo:'T', valor:'$ 1.234,56'}});
+      assert.equal(r.status, 200);
+      const got = (await api('/api/pipeline')).json()[OC];
+      assert.equal(got.valorNum, 1234.56);
+      assert.equal(got.probabilidad, 50);
+    });
+    it('preserva campos no enviados en actualizaciones parciales', async () => {
+      const r = await api(`/api/pipeline/${OC}`, {method:'POST', body:{notas:'llamé a la entidad'}});
+      assert.equal(r.status, 200);
+      const got = (await api('/api/pipeline')).json()[OC];
+      assert.equal(got.notas, 'llamé a la entidad');
+      assert.equal(got.entidad, 'E');
+      assert.equal(got.valorNum, 1234.56);
+      assert.equal(got.status, 'Preparando oferta');
+    });
+    it('registra historial de cambios con campo anterior/nuevo', async () => {
+      await api(`/api/pipeline/${OC}`, {method:'POST', body:{status:'Ganada', montoOferta:'48000'}});
+      const h = (await api(`/api/pipeline/${OC}`)).json();
+      assert.ok(Array.isArray(h));
+      assert.ok(h.length >= 2, 'debe tener al menos 2 movimientos');
+      const st = h.find(e => e.field === 'status');
+      assert.equal(st.old_value, 'Preparando oferta');
+      assert.equal(st.new_value, 'Ganada');
+      const got = (await api('/api/pipeline')).json()[OC];
+      assert.equal(got.probabilidad, 100);
+      assert.equal(got.montoOfertaNum, 48000);
+    });
+    it('acepta probabilidad manual acotada 0-100', async () => {
+      await api(`/api/pipeline/${OC}`, {method:'POST', body:{probabilidad: 250}});
+      const got = (await api('/api/pipeline')).json()[OC];
+      assert.equal(got.probabilidad, 100);
+    });
+    it('GET /api/users responde lista de responsables', async () => {
+      const r = await api('/api/users');
+      assert.equal(r.status, 200);
+      assert.ok(Array.isArray(r.json()));
+    });
+    after(async () => { await api(`/api/pipeline/${OC}`, {method:'DELETE'}); });
+  });
+
   it('GET /api/entity-live validates query input', async () => {
     const empty = await api('/api/entity-live?q=&year=2026');
     assert.equal(empty.status, 400);

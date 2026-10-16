@@ -195,6 +195,19 @@ function initDB(){
   try { db.exec("ALTER TABLE pipeline ADD COLUMN contacto TEXT"); } catch(e){}
   try { db.exec("ALTER TABLE pipeline ADD COLUMN snapshot TEXT"); } catch(e){}
   try { db.exec("ALTER TABLE pipeline ADD COLUMN snapshot_at TEXT"); } catch(e){}
+  // Sprint 1 (CRM): campos numéricos, responsable y probabilidad de cierre
+  try { db.exec("ALTER TABLE pipeline ADD COLUMN valor_num REAL"); } catch(e){}
+  try { db.exec("ALTER TABLE pipeline ADD COLUMN monto_oferta_num REAL"); } catch(e){}
+  try { db.exec("ALTER TABLE pipeline ADD COLUMN owner_id INTEGER"); } catch(e){}
+  try { db.exec("ALTER TABLE pipeline ADD COLUMN probabilidad INTEGER"); } catch(e){}
+  // Historial de movimientos del embudo (auditoría comercial)
+  db.exec(`CREATE TABLE IF NOT EXISTS pipeline_history(
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ocid TEXT, field TEXT, old_value TEXT, new_value TEXT,
+    user TEXT DEFAULT '', created_at TEXT DEFAULT (datetime('now')))`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_pipe_hist_ocid ON pipeline_history(ocid)`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_pipe_owner ON pipeline(owner_id)`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_pipe_status ON pipeline(status)`);
   db.exec(`CREATE TABLE IF NOT EXISTS entidades(
     entity_id TEXT PRIMARY KEY, name TEXT, source TEXT,
     updated_at TEXT DEFAULT (datetime('now')))`);
@@ -2105,8 +2118,41 @@ function getProcessRow(ocid){
 }
 
 // Pipeline
+const PIPELINE_STATUSES = ['Nuevo interés','En análisis','Preparando oferta','Cotización enviada','Oferta presentada','Ganada','Perdida','Descartada'];
+const PROBABILIDAD_BY_STATUS = {
+  'Nuevo interés': 10, 'En análisis': 25, 'Preparando oferta': 50, 'Cotización enviada': 60,
+  'Oferta presentada': 75, 'Ganada': 100, 'Perdida': 0, 'Descartada': 0
+};
+
+// Convierte "$ 1.234,56", "1234.56" o número a número USD (null si no aplica).
+function parseMoney(v){
+  if(v === null || v === undefined || v === '') return null;
+  if(typeof v === 'number') return isFinite(v) ? v : null;
+  const s = String(v).replace(/[^0-9.,\-]/g, '');
+  if(!s) return null;
+  let n;
+  if(s.includes(',') && s.includes('.')){
+    // separador de miles: último símbolo es el decimal
+    if(s.lastIndexOf(',') > s.lastIndexOf('.')) n = parseFloat(s.replace(/\./g,'').replace(',','.'));
+    else n = parseFloat(s.replace(/,/g,''));
+  } else if(s.includes(',')){
+    // coma única con 1-2 decimales → decimal; con 3 dígitos → miles
+    const parts = s.split(',');
+    n = (parts[1] && parts[1].length !== 3) ? parseFloat(parts.join('.')) : parseFloat(parts.join(''));
+  } else n = parseFloat(s);
+  return isFinite(n) ? n : null;
+}
+
+function clampProb(v){
+  const n = Math.round(Number(v));
+  if(!isFinite(n)) return null;
+  return Math.max(0, Math.min(100, n));
+}
+
 function getPipeline(){
-  const rows = dbAll("SELECT ocid, status, notas, entidad, titulo, modalidad, etapa_label, valor, cierre, publicado, actualizado, cpcs, etiquetas, source, fecha_presentacion, monto_oferta, competidores, contacto FROM pipeline");
+  const rows = dbAll("SELECT ocid, status, notas, entidad, titulo, modalidad, etapa_label, valor, cierre, publicado, actualizado, cpcs, etiquetas, source, fecha_presentacion, monto_oferta, competidores, contacto, valor_num, monto_oferta_num, owner_id, probabilidad FROM pipeline");
+  const owners = new Map();
+  try { dbAll("SELECT id, username FROM users").forEach(u => owners.set(u.id, u.username)); } catch(_){}
   const out = {};
   rows.forEach(r => {
     let cpcs = [], etiquetas = [];
@@ -2115,24 +2161,91 @@ function getPipeline(){
     out[r.ocid] = { status:r.status, notas:r.notas, entidad:r.entidad, titulo:r.titulo, modalidad:r.modalidad,
       etapaLabel:r.etapa_label, valor:r.valor, cierre:r.cierre, publicado:r.publicado, actualizado:r.actualizado,
       cpcs, etiquetas, source:r.source, fechaPresentacion:r.fecha_presentacion || null,
-      montoOferta:r.monto_oferta || null, competidores:r.competidores || null, contacto:r.contacto || null };
+      montoOferta:r.monto_oferta || null, competidores:r.competidores || null, contacto:r.contacto || null,
+      valorNum: r.valor_num ?? parseMoney(r.valor), montoOfertaNum: r.monto_oferta_num ?? parseMoney(r.monto_oferta),
+      ownerId: r.owner_id ?? null, ownerName: r.owner_id != null ? (owners.get(r.owner_id) || null) : null,
+      probabilidad: r.probabilidad ?? PROBABILIDAD_BY_STATUS[r.status] ?? null };
   });
   return out;
 }
 
-function savePipelineEntry(ocid, p){
-  dbRun(`INSERT INTO pipeline(ocid, status, notas, entidad, titulo, modalidad, etapa_label, valor, cierre, publicado, actualizado, cpcs, etiquetas, source, fecha_presentacion, monto_oferta, competidores, contacto)
-    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+function logPipelineHistory(ocid, field, oldValue, newValue, user){
+  if(String(oldValue ?? '') === String(newValue ?? '')) return;
+  dbRun("INSERT INTO pipeline_history(ocid, field, old_value, new_value, user) VALUES(?,?,?,?,?)",
+    [ocid, field, String(oldValue ?? ''), String(newValue ?? ''), user || '']);
+}
+
+// Guarda una entrada del pipeline preservando campos no enviados (evita sobrescribir
+// datos de otros usuarios por lecturas obsoletas del cliente) y registrando en
+// el historial los cambios relevantes para la trazabilidad comercial.
+function savePipelineEntry(ocid, p, user){
+  const prev = dbGet("SELECT * FROM pipeline WHERE ocid=?", [ocid]);
+  const pick = (key, fallback) => (p[key] !== undefined ? p[key] : (prev ? prev[fallback] : null));
+  const status = pick('status', 'status') || 'Nuevo interés';
+  const notas = pick('notas', 'notas');
+  const entidad = pick('entidad', 'entidad');
+  const titulo = pick('titulo', 'titulo');
+  const modalidad = pick('modalidad', 'modalidad');
+  const etapaLabel = pick('etapaLabel', 'etapa_label');
+  const valor = pick('valor', 'valor');
+  const cierre = pick('cierre', 'cierre');
+  const publicado = pick('publicado', 'publicado');
+  const actualizado = pick('actualizado', 'actualizado');
+  const cpcs = p.cpcs !== undefined ? JSON.stringify(Array.isArray(p.cpcs) ? p.cpcs : [])
+    : (prev ? prev.cpcs : '[]');
+  const etiquetas = p.etiquetas !== undefined ? JSON.stringify(Array.isArray(p.etiquetas) ? p.etiquetas : [])
+    : (prev ? prev.etiquetas : '[]');
+  const source = pick('source', 'source') || 'SERCOP';
+  const fechaPresentacion = pick('fechaPresentacion', 'fecha_presentacion');
+  const montoOferta = pick('montoOferta', 'monto_oferta');
+  const competidores = pick('competidores', 'competidores');
+  const contacto = pick('contacto', 'contacto');
+  const valorNum = p.valorNum !== undefined ? parseMoney(p.valorNum)
+    : (prev ? (prev.valor_num ?? parseMoney(prev.valor)) : parseMoney(valor));
+  const montoOfertaNum = p.montoOfertaNum !== undefined ? parseMoney(p.montoOfertaNum)
+    : (prev ? (prev.monto_oferta_num ?? parseMoney(prev.monto_oferta)) : parseMoney(montoOferta));
+  const ownerId = p.ownerId !== undefined ? (Number.isFinite(Number(p.ownerId)) ? Number(p.ownerId) : null)
+    : (prev ? prev.owner_id : null);
+  const statusChanged = !prev || prev.status !== status;
+  const probInput = p.probabilidad !== undefined ? clampProb(p.probabilidad)
+    : (!statusChanged && prev ? prev.probabilidad : null);
+  const probabilidad = probInput != null ? probInput : (PROBABILIDAD_BY_STATUS[status] ?? null);
+
+  const snapshot = p.snapshot !== undefined ? p.snapshot : (prev ? prev.snapshot : null);
+  const snapshotAt = p.snapshotAt !== undefined ? p.snapshotAt : (prev ? prev.snapshot_at : null);
+
+  dbRun(`INSERT INTO pipeline(ocid, status, notas, entidad, titulo, modalidad, etapa_label, valor, cierre, publicado, actualizado, cpcs, etiquetas, source, fecha_presentacion, monto_oferta, competidores, contacto, valor_num, monto_oferta_num, owner_id, probabilidad, snapshot, snapshot_at)
+    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
     ON CONFLICT(ocid) DO UPDATE SET
       status=excluded.status, notas=excluded.notas, entidad=excluded.entidad, titulo=excluded.titulo,
       modalidad=excluded.modalidad, etapa_label=excluded.etapa_label, valor=excluded.valor, cierre=excluded.cierre,
       publicado=excluded.publicado, actualizado=excluded.actualizado, cpcs=excluded.cpcs, etiquetas=excluded.etiquetas,
       source=excluded.source, fecha_presentacion=excluded.fecha_presentacion, monto_oferta=excluded.monto_oferta,
       competidores=excluded.competidores, contacto=excluded.contacto,
-      snapshot=COALESCE(excluded.snapshot, pipeline.snapshot), snapshot_at=COALESCE(excluded.snapshot_at, pipeline.snapshot_at)`,
-    [ocid, p.status, p.notas, p.entidad, p.titulo, p.modalidad, p.etapaLabel, p.valor, p.cierre, p.publicado, p.actualizado,
-     JSON.stringify(Array.isArray(p.cpcs) ? p.cpcs : []), JSON.stringify(Array.isArray(p.etiquetas) ? p.etiquetas : []), p.source || 'SERCOP',
-     p.fechaPresentacion || null, p.montoOferta || null, p.competidores || null, p.contacto || null]);
+      valor_num=excluded.valor_num, monto_oferta_num=excluded.monto_oferta_num,
+      owner_id=excluded.owner_id, probabilidad=excluded.probabilidad,
+      snapshot=excluded.snapshot, snapshot_at=excluded.snapshot_at`,
+    [ocid, status, notas, entidad, titulo, modalidad, etapaLabel, valor, cierre, publicado, actualizado,
+     cpcs, etiquetas, source, fechaPresentacion, montoOferta, competidores, contacto,
+     valorNum, montoOfertaNum, ownerId, probabilidad, snapshot, snapshotAt]);
+
+  if(prev){
+    logPipelineHistory(ocid, 'status', prev.status, status, user);
+    logPipelineHistory(ocid, 'notas', prev.notas, notas, user);
+    logPipelineHistory(ocid, 'owner', prev.owner_id, ownerId, user);
+    logPipelineHistory(ocid, 'probabilidad', prev.probabilidad, probabilidad, user);
+    logPipelineHistory(ocid, 'montoOferta', prev.monto_oferta, montoOferta, user);
+    logPipelineHistory(ocid, 'etapa', prev.etapa_label, etapaLabel, user);
+    logPipelineHistory(ocid, 'cierre', prev.cierre, cierre, user);
+  } else {
+    logPipelineHistory(ocid, 'creado', null, status || 'Nuevo interés', user);
+  }
+  return { status, probabilidad, ownerId };
+}
+
+function getPipelineHistory(ocid, limit){
+  const lim = Math.min(Math.max(parseInt(limit, 10) || 50, 1), 500);
+  return dbAll("SELECT field, old_value, new_value, user, created_at FROM pipeline_history WHERE ocid=? ORDER BY id DESC LIMIT ?", [ocid, lim]);
 }
 
 function deletePipelineEntry(ocid){
@@ -2209,8 +2322,8 @@ async function detectPipelineChanges(force){
           changedList.push({ ocid: r.ocid, summary, entidad: proc?.entidad || '' });
         }
         dbRun(`UPDATE pipeline SET cierre=COALESCE(?,cierre), etapa_label=COALESCE(?,etapa_label),
-          valor=COALESCE(?,valor), actualizado=datetime('now'), snapshot=?, snapshot_at=datetime('now') WHERE ocid=?`,
-          [snap.closeDate || null, snap.stageLabel || null, fmtAmt(snap.valueAmount) || null, JSON.stringify(snap), r.ocid]);
+          valor=COALESCE(?,valor), valor_num=COALESCE(?,valor_num), actualizado=datetime('now'), snapshot=?, snapshot_at=datetime('now') WHERE ocid=?`,
+          [snap.closeDate || null, snap.stageLabel || null, fmtAmt(snap.valueAmount) || null, snap.valueAmount ?? null, JSON.stringify(snap), r.ocid]);
       } else {
         dbRun("UPDATE pipeline SET snapshot=?, snapshot_at=datetime('now') WHERE ocid=?", [JSON.stringify(snap), r.ocid]);
       }
@@ -2856,6 +2969,13 @@ const server = http.createServer(async (req, res) => {
       return await handleChangePassword(req, res, authResult);
     }
 
+    // -- Usuarios del equipo (responsables del pipeline) ----------
+    if(pathname === '/api/users' && req.method === 'GET'){
+      let users = [];
+      try { users = dbAll("SELECT id, username, role FROM users ORDER BY username"); } catch(_){}
+      return json(res, 200, users);
+    }
+
     // -- Static files --
     if(pathname === '/' || pathname === '/sercop.html'){
       return serveFile(res, path.join(__dirname, 'sercop.html'), nonce);
@@ -3019,8 +3139,11 @@ const server = http.createServer(async (req, res) => {
       const ocid = decodeURIComponent(pipelineMatch[1]);
       if(req.method === 'POST'){
         const body = JSON.parse(await collectBody(req));
-        savePipelineEntry(ocid, body);
-        return json(res, 200, {ok:true});
+        const saved = savePipelineEntry(ocid, body, (authResult.user && authResult.user.username) || '');
+        return json(res, 200, {ok:true, ...saved});
+      }
+      if(req.method === 'GET'){
+        return json(res, 200, getPipelineHistory(ocid, params.limit));
       }
       if(req.method === 'DELETE'){
         deletePipelineEntry(ocid);
