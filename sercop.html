@@ -412,7 +412,7 @@
         </div>
         <div>
           <label>Año</label>
-          <input type="number" id="newYear" min="2015" max="2100" placeholder="año actual">
+          <input type="number" id="newYear" min="2015" placeholder="año actual">
         </div>
         <div>
           <label>Palabras clave (separadas por coma)</label>
@@ -420,11 +420,11 @@
         </div>
         <div>
           <label>Entidad compradora</label>
-          <input type="text" id="newBuyer" placeholder="opcional">
+          <input type="text" id="newBuyer" placeholder="opcional, mínimo 3 caracteres">
         </div>
         <div>
           <label>Proveedor</label>
-          <input type="text" id="newSupplier" placeholder="opcional">
+          <input type="text" id="newSupplier" placeholder="opcional, mínimo 3 caracteres">
         </div>
         <div>
           <label>Códigos CPC (separados por coma)</label>
@@ -452,7 +452,7 @@
         <button class="btn btn-ghost" data-act="toggle-form" data-open="0">Cancelar</button>
       </div>
       <div class="note">
-        La API pública de SERCOP busca por <b>palabra clave</b> sobre título/descripción del proceso. Este radar acepta <b>varios términos separados por coma</b>.
+        La API pública de SERCOP busca por <b>palabra clave</b> (mínimo 3 caracteres) en el año 2015 hasta el año en curso. Comprador y proveedor son opcionales y, si se indican, también necesitan al menos 3 caracteres. Este radar acepta <b>varios términos separados por coma</b>.
         Para "ethical hacking" prueba algo como: <code>hacking ético, pentest, pruebas de penetración, análisis de vulnerabilidades</code>.
       </div>
     </div>
@@ -710,7 +710,7 @@
       </div>
       <div style="width:90px;">
         <label>Año</label>
-        <input type="number" id="entityLiveYear" min="2015" max="2100" value="2026" style="width:100%;">
+        <input type="number" id="entityLiveYear" min="2015" style="width:100%;">
       </div>
       <button class="btn btn-primary" id="btnEntityLive" data-act="search-entity-live">Buscar</button>
       <button class="btn btn-ghost" data-act="export-entity-live" id="btnExportEntityLive" style="display:none;">Excel</button>
@@ -852,6 +852,20 @@ const safeHref = v => {
 };
 const fmtMoney = (n,c) => (n===undefined||n===null||isNaN(n)) ? '—' : `${Number(n).toLocaleString('es-EC',{maximumFractionDigits:2})} ${c||'USD'}`;
 const parseTerms = str => String(str||'').split(',').map(t=>t.trim()).filter(t=>t.length>=3);
+const SERCOP_YEAR_MIN = 2015;
+const usesSercopSource = source => source === 'sercop' || source === 'todas' || source === 'ambos';
+function sercopFormError(){
+  const source = $('newSource').value || 'sercop';
+  if(!usesSercopSource(source)) return '';
+  const max = new Date().getFullYear();
+  const year = Number(($('newYear').value || '').trim() || max);
+  if(!Number.isInteger(year) || year < SERCOP_YEAR_MIN || year > max) return `SERCOP solo admite años entre ${SERCOP_YEAR_MIN} y ${max}.`;
+  const buyer = $('newBuyer').value.trim();
+  const supplier = $('newSupplier').value.trim();
+  if(buyer && buyer.length < 3) return 'La entidad compradora debe tener al menos 3 caracteres.';
+  if(supplier && supplier.length < 3) return 'El proveedor debe tener al menos 3 caracteres.';
+  return '';
+}
 const parseCpcCodes = str => String(str||'').split(',').map(t=>t.trim()).filter(t=>t.length>0);
 const firstNonEmpty = (...vals) => vals.find(v => v !== undefined && v !== null && String(v).trim() !== '');
 const sleep = ms => new Promise(r => setTimeout(r, ms));
@@ -951,7 +965,14 @@ function hasEncodingIssues(str){
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────
-function getBuyerLabel(row){ return String(firstNonEmpty(row?.buyerName, row?.buyer_name, row?.buyer?.name, row?.entidad, row?.buyer?.identifier?.legalName, row?.buyer?.identifier?.id, row?.buyerId) ?? '—'); }
+function partyLabel(value){
+  if(value == null || value === '') return '';
+  if(typeof value === 'string') return value.trim();
+  if(Array.isArray(value)) return value.map(partyLabel).filter(Boolean).join(', ');
+  if(typeof value === 'object') return String(value.name || value.legalName || value.identifier?.legalName || value.identifier?.id || '').trim();
+  return '';
+}
+function getBuyerLabel(row){ return String(firstNonEmpty(partyLabel(row?.buyerName), partyLabel(row?.buyer_name), partyLabel(row?.buyer), partyLabel(row?.entidad), row?.buyer?.identifier?.legalName, row?.buyer?.identifier?.id, row?.buyerId) ?? '—'); }
 function getRowTitle(row){ return String(firstNonEmpty(row?.title, row?.tender?.title, row?.description, row?.ocid) ?? '—'); }
 function getRowDescription(row){ return String(firstNonEmpty(row?.description, row?.tender?.description) ?? ''); }
 function getRowDate(row){ return String(firstNonEmpty(row?.datePublished, row?.publishedDate, row?.releaseDate, row?.date, row?.tender?.datePublished, row?.tender?.tenderPeriod?.startDate) ?? ''); }
@@ -1457,6 +1478,8 @@ async function createRadar(){
   clearErr();
   if(!nombre){ showErr('Ponle un nombre al radar.'); return; }
   if(!parseTerms(search).length){ showErr('Ingresa al menos una palabra clave de 3+ caracteres.'); return; }
+  const contractErr = sercopFormError();
+  if(contractErr){ showErr(contractErr); return; }
   const id = 'r_' + Date.now();
   const radar = {
     id, nombre, year: $('newYear').value.trim() || new Date().getFullYear(), search,
@@ -1496,6 +1519,8 @@ function startEditRadar(id){
 async function saveEditRadar(){
   const r = S.radares.find(x=>x.id===S.editingRadarId);
   if(!r) return;
+  const contractErr = sercopFormError();
+  if(contractErr){ showErr(contractErr); return; }
   r.source = $('newSource').value || 'sercop';
   r.nombre = $('newName').value.trim();
   r.year = $('newYear').value.trim() || new Date().getFullYear();
@@ -1984,6 +2009,10 @@ async function searchEntityLive(){
   const year = $('entityLiveYear').value || new Date().getFullYear();
   $('entityLiveError').style.display='none';
   if(q.length < 3){ $('entityLiveError').innerHTML = 'Escribe al menos 3 caracteres del nombre de la entidad.'; $('entityLiveError').style.display='block'; return; }
+  if(term.length < 3){ $('entityLiveError').innerHTML = 'SERCOP exige una palabra clave de al menos 3 caracteres.'; $('entityLiveError').style.display='block'; return; }
+  const liveYear = Number(year);
+  const liveMax = new Date().getFullYear();
+  if(!Number.isInteger(liveYear) || liveYear < SERCOP_YEAR_MIN || liveYear > liveMax){ $('entityLiveError').innerHTML = `SERCOP solo admite años entre ${SERCOP_YEAR_MIN} y ${liveMax}.`; $('entityLiveError').style.display='block'; return; }
   $('entityLiveResults').style.display='none';
   $('entityLiveLoading').style.display='block';
   $('btnEntityLive').disabled = true;
@@ -3205,6 +3234,17 @@ document.addEventListener('click', e => {
     dd.classList.remove('open');
   }
 });
+
+(() => {
+  const max = String(new Date().getFullYear());
+  ['newYear', 'entityLiveYear'].forEach(id => {
+    const el = document.getElementById(id);
+    if(!el) return;
+    el.min = String(SERCOP_YEAR_MIN);
+    el.max = max;
+    if(id === 'entityLiveYear' && !el.value) el.value = max;
+  });
+})();
 
 init();
 </script>

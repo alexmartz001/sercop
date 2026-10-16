@@ -1,4 +1,6 @@
 const http = require('node:http');
+const https = require('node:https');
+const dns = require('node:dns');
 const crypto = require('node:crypto');
 const Database = require('better-sqlite3');
 const fs = require('node:fs');
@@ -443,30 +445,266 @@ function dbRun(sql, params=[]){
 }
 
 // -- SERCOP API Client ----------------------------------------------
-let fetchGate = Promise.resolve();
-async function waitForExternalFetchSlot(){
-  const slot = fetchGate.then(() => sleep(EXTERNAL_FETCH_DELAY));
-  fetchGate = slot.catch(() => {});
-  await slot;
+// datosabiertos.compraspublicas.gob.ec publica más de una IP. Una de ellas
+// deja la conexión colgada y el fetch nativo aborta con "fetch failed" sin
+// probar la otra. Aquí se recorren todas las direcciones, se recuerda la que
+// respondió y las peticiones salen de una en una para no disparar el cupo
+// (60/min, cabecera Retry-After).
+const CONNECT_TIMEOUT_MS = Math.max(2000, Number(process.env.NVG_CONNECT_TIMEOUT_MS) || 8000);
+const RESPONSE_TIMEOUT_MS = Math.max(5000, Number(process.env.NVG_RESPONSE_TIMEOUT_MS) || 30000);
+const HEALTHY_TTL_MS = 10 * 60 * 1000;
+const MAX_RESPONSE_BYTES = 25 * 1024 * 1024;
+const healthyAddress = new Map();
+let fetchChain = Promise.resolve();
+
+function enqueueExternalFetch(task){
+  const run = fetchChain.then(async () => {
+    await sleep(EXTERNAL_FETCH_DELAY);
+    return task();
+  });
+  fetchChain = run.then(() => {}, () => {});
+  return run;
+}
+
+function lookupPinned(address, family){
+  return function lookup(_hostname, options, cb){
+    if(typeof options === 'function'){ cb = options; options = {}; }
+    const fam = family || (String(address).includes(':') ? 6 : 4);
+    // El callback de lookup tiene que ser asíncrono. Si se llama en el mismo
+    // turno, Node pierde el socket y la petición se queda hasta el timeout.
+    process.nextTick(() => {
+      if(options && options.all) cb(null, [{address, family: fam}]);
+      else cb(null, address, fam);
+    });
+  };
+}
+
+async function resolveHostAddresses(hostname){
+  let records = [];
+  try{
+    records = await dns.promises.lookup(hostname, {all: true});
+  }catch(e){
+    throw Object.assign(new Error(`no se pudo resolver ${hostname}`), {code: e.code || 'ENOTFOUND'});
+  }
+  const addrs = [];
+  const sorted = [...records].sort((a, b) => Number(a.family) - Number(b.family));
+  for(const rec of sorted){
+    if(rec?.address && !addrs.some(a => a.address === rec.address)) addrs.push({address: rec.address, family: rec.family});
+  }
+  if(!addrs.length) throw Object.assign(new Error(`DNS sin direcciones para ${hostname}`), {code: 'ENOTFOUND'});
+  const healthy = healthyAddress.get(hostname);
+  if(healthy && healthy.until > Date.now()){
+    const idx = addrs.findIndex(a => a.address === healthy.address);
+    if(idx > 0){
+      const [hit] = addrs.splice(idx, 1);
+      addrs.unshift(hit);
+    }
+  }
+  return addrs;
+}
+
+function headerGet(headers, name){
+  const v = headers[String(name).toLowerCase()];
+  if(v == null) return null;
+  return Array.isArray(v) ? v.join(', ') : String(v);
+}
+
+function requestOnce(urlObj, opts, target){
+  let req;
+  let settled = false;
+  let rejectFn = () => {};
+  const promise = new Promise((resolve, reject) => {
+    rejectFn = reject;
+    const fail = (err) => {
+      if(settled) return;
+      settled = true;
+      if(err && !err.address) err.address = target.address;
+      reject(err);
+    };
+    const lib = urlObj.protocol === 'https:' ? https : http;
+    const headers = {'Accept':'application/json', 'User-Agent':'NVG-Radar/11', ...(opts.headers || {})};
+    const body = opts.body == null ? null : (Buffer.isBuffer(opts.body) ? opts.body : Buffer.from(String(opts.body)));
+    if(body && !Object.keys(headers).some(k => k.toLowerCase() === 'content-length')){
+      headers['Content-Length'] = String(body.length);
+    }
+    req = lib.request({
+      protocol: urlObj.protocol,
+      hostname: urlObj.hostname,
+      servername: urlObj.hostname,
+      port: urlObj.port || (urlObj.protocol === 'https:' ? 443 : 80),
+      path: `${urlObj.pathname}${urlObj.search}`,
+      method: opts.method || 'GET',
+      headers,
+      lookup: lookupPinned(target.address, target.family),
+      timeout: CONNECT_TIMEOUT_MS,
+      autoSelectFamily: false,
+      agent: false
+    }, (res) => {
+      req.setTimeout(RESPONSE_TIMEOUT_MS);
+      const chunks = [];
+      let size = 0;
+      res.on('data', (c) => {
+        size += c.length;
+        if(size > MAX_RESPONSE_BYTES){
+          fail(Object.assign(new Error('respuesta demasiado grande'), {code:'ERR_BODY_TOO_LARGE'}));
+          req.destroy();
+          return;
+        }
+        chunks.push(c);
+      });
+      res.on('end', () => {
+        if(settled) return;
+        settled = true;
+        const buf = Buffer.concat(chunks);
+        const status = res.statusCode || 0;
+        resolve({
+          status,
+          ok: status >= 200 && status < 300,
+          headers: {get: (name) => headerGet(res.headers, name)},
+          text: async () => buf.toString('utf8'),
+          json: async () => JSON.parse(buf.toString('utf8')),
+          address: target.address
+        });
+      });
+      res.on('error', fail);
+    });
+    req.on('timeout', () => {
+      fail(Object.assign(new Error(`tiempo de conexión agotado (${target.address})`), {code:'ETIMEDOUT', address: target.address}));
+      req.destroy();
+    });
+    req.on('error', fail);
+    if(body) req.write(body);
+    req.end();
+  });
+  return {
+    promise,
+    abort(){
+      if(settled) return;
+      settled = true;
+      try{
+        if(req){
+          req.setTimeout(0);
+          if(req.socket) req.socket.destroy();
+          req.destroy();
+        }
+      }catch(_){}
+      rejectFn(Object.assign(new Error('abort'), {code:'ABORT', address: target.address}));
+    }
+  };
+}
+
+async function requestFirstReachable(urlObj, opts, targets){
+  let lastErr = null;
+  for(const target of targets){
+    const handle = requestOnce(urlObj, opts, target);
+    try{
+      const resp = await handle.promise;
+      if(resp.status >= 500 || resp.status === 408){
+        lastErr = new Error(`HTTP ${resp.status}`);
+        console.warn(`  ${urlObj.hostname} vía ${target.address}: HTTP ${resp.status}`);
+        continue;
+      }
+      return resp;
+    }catch(e){
+      lastErr = e;
+      if(e.code !== 'ABORT') console.warn(`  ${urlObj.hostname} vía ${target.address}: ${e.code || e.message}`);
+    }
+  }
+  const detail = lastErr ? (lastErr.code || lastErr.message) : 'sin respuesta';
+  throw Object.assign(new Error(`conexión fallida con ${urlObj.hostname} (${detail})`), {code: lastErr?.code || 'ECONN'});
+}
+
+function retryAfterMs(resp, attempt){
+  const raw = resp?.headers?.get?.('retry-after');
+  if(raw != null && String(raw).trim() !== ''){
+    const sec = Number(raw);
+    if(Number.isFinite(sec) && sec >= 0) return Math.min(sec * 1000, 60000);
+  }
+  const reset = Number(resp?.headers?.get?.('x-ratelimit-reset'));
+  if(Number.isFinite(reset) && reset > 0){
+    const ms = reset > 1e12 ? reset - Date.now() : reset * 1000 - Date.now();
+    if(ms > 0 && ms < 120000) return ms;
+  }
+  return Math.min(2000 * Math.pow(2, attempt), 15000);
+}
+
+async function fetchOnceWithFailover(url, opts, redirects = 0){
+  const urlObj = new URL(url);
+  const all = await resolveHostAddresses(urlObj.hostname);
+  const healthy = healthyAddress.get(urlObj.hostname);
+  const pinned = healthy && healthy.until > Date.now() ? all.filter(a => a.address === healthy.address) : [];
+  const targets = pinned.length ? [...pinned, ...all.filter(a => a.address !== pinned[0].address)] : all;
+  let resp;
+  try{
+    resp = await requestFirstReachable(urlObj, opts, targets);
+  }catch(e){
+    if(pinned.length) healthyAddress.delete(urlObj.hostname);
+    throw e;
+  }
+  const method = String(opts.method || 'GET').toUpperCase();
+  if(redirects < 4 && [301, 302, 303, 307, 308].includes(resp.status) && (method === 'GET' || method === 'HEAD')){
+    const loc = resp.headers.get('location');
+    if(loc) return fetchOnceWithFailover(new URL(loc, url).toString(), opts, redirects + 1);
+  }
+  if(resp.address && (resp.ok || resp.status === 429 || (resp.status >= 400 && resp.status < 500))){
+    healthyAddress.set(urlObj.hostname, {address: resp.address, until: Date.now() + HEALTHY_TTL_MS});
+  }
+  return resp;
 }
 
 async function fetchWithRetry(url, opts={}, retries=MAX_RETRIES){
   const okStatuses = Array.isArray(opts.okStatuses) ? opts.okStatuses : [];
   const fetchOpts = {...opts};
   delete fetchOpts.okStatuses;
+  return enqueueExternalFetch(() => fetchWithRetryUnlocked(url, fetchOpts, okStatuses, retries));
+}
+
+async function fetchWithRetryUnlocked(url, fetchOpts, okStatuses, retries){
+  let lastErr = null;
   for(let attempt = 0; attempt <= retries; attempt++){
-    await waitForExternalFetchSlot();
-    const resp = await fetch(url, fetchOpts);
-    if(resp.status === 429 && attempt < retries){
-      const wait = Math.min(2000 * Math.pow(2, attempt), 15000) + Math.floor(Math.random() * 500);
-      console.warn(`  429 rate limit, waiting ${wait}ms (attempt ${attempt+1}/${retries})`);
+    let resp;
+    try{
+      resp = await fetchOnceWithFailover(url, fetchOpts);
+    }catch(e){
+      lastErr = e;
+      if(attempt >= retries) break;
+      const wait = Math.min(1000 * Math.pow(2, attempt), 8000);
+      console.warn(`  reintento ${attempt + 1}/${retries} tras fallo de red: ${e.message}`);
       await sleep(wait);
       continue;
     }
+    if(resp.status === 429 && attempt < retries){
+      const wait = retryAfterMs(resp, attempt) + Math.floor(Math.random() * 250);
+      console.warn(`  429 rate limit, waiting ${wait}ms (attempt ${attempt + 1}/${retries})`);
+      await sleep(wait);
+      lastErr = new Error('HTTP 429');
+      continue;
+    }
     if(okStatuses.includes(resp.status)) return resp;
-    if(!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    if(!resp.ok) throw new Error(await sercopHttpDetail(resp));
+    const remainHeader = resp.headers.get('x-ratelimit-remaining');
+    if(remainHeader != null && remainHeader !== '' && Number(remainHeader) === 0){
+      const wait = retryAfterMs(resp, 0);
+      if(wait > 0) await sleep(Math.min(wait, 60000));
+    }
     return resp;
   }
+  if(lastErr) throw lastErr;
+  throw new Error('HTTP 429');
+}
+
+async function sercopHttpDetail(resp){
+  let detail = '';
+  try{
+    const parsed = JSON.parse(await resp.text());
+    const fieldErrors = parsed?.errors && typeof parsed.errors === 'object'
+      ? Object.values(parsed.errors).flat().map(v => String(v || '').trim()).filter(Boolean).slice(0, 3).join('; ')
+      : '';
+    detail = fieldErrors || (typeof parsed?.message === 'string' ? parsed.message : '');
+  }catch(_){}
+  detail = String(detail || '').replace(/\s+/g, ' ').trim().slice(0, 180);
+  if(/too many attempts/i.test(detail)) detail = 'demasiadas consultas al portal';
+  return detail ? `HTTP ${resp.status}: ${detail}` : `HTTP ${resp.status}`;
 }
 
 function getCached(url){
@@ -504,6 +742,35 @@ const wantsSource = (radar, source) => {
 };
 const SEARCH_STOP_WORDS = new Set(['con','del','desde','el','en','la','las','los','para','por','una','uno','y']);
 const splitRadarTerms = value => String(value || '').split(',').map(t => t.trim()).filter(t => t.length >= 2);
+// Contrato de search_ocds: year 2015..año actual; search, buyer y supplier
+// con al menos 3 caracteres. https://datosabiertos.compraspublicas.gob.ec/PLATAFORMA/datos-abiertos/api
+const SERCOP_YEAR_MIN = 2015;
+const sercopCurrentYear = () => new Date().getFullYear();
+const sercopKeyword = value => {
+  const s = String(value ?? '').trim();
+  return s.length >= 3 ? s : '';
+};
+function sercopYear(year){
+  const y = Number(year);
+  if(!Number.isInteger(y) || y < SERCOP_YEAR_MIN || y > sercopCurrentYear()) return null;
+  return y;
+}
+function sercopQuery(term, year, buyer, supplier){
+  const search = sercopKeyword(term);
+  const y = sercopYear(year);
+  const buyerText = String(buyer ?? '').trim();
+  const supplierText = String(supplier ?? '').trim();
+  return {
+    search,
+    year: y,
+    buyer: buyerText ? sercopKeyword(buyerText) : '',
+    supplier: supplierText ? sercopKeyword(supplierText) : '',
+    shortSearch: !search,
+    badYear: !!search && !y,
+    shortBuyer: !!buyerText && buyerText.length < 3,
+    shortSupplier: !!supplierText && supplierText.length < 3
+  };
+}
 const escapeRe = s => String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
 function termTokens(term){
@@ -533,12 +800,27 @@ function rowSearchText(row){
   ]);
   return [
     row?.title, row?.description,
-    row?.buyerName, row?.buyer_name, row?.entidad,
-    row?.buyer?.name, row?.buyer?.identifier?.legalName,
+    partyName(row?.buyerName), partyName(row?.buyer_name), partyName(row?.buyer), partyName(row?.entidad),
+    row?.single_provider, partyName(row?.suppliers),
     row?.internal_type, row?.method, row?.modalidad,
     row?.procurementMethodDetails, row?.tender?.procurementMethod,
     ...itemFields
   ].filter(Boolean).join(' | ');
+}
+
+function partyName(value){
+  if(value == null || value === '') return '';
+  if(typeof value === 'string') return value.trim();
+  if(Array.isArray(value)) return value.map(partyName).filter(Boolean).join(', ');
+  if(typeof value === 'object') return String(firstNonEmpty(value.name, value.legalName, value.identifier?.legalName, value.identifier?.id) ?? '').trim();
+  return '';
+}
+
+function partyList(value){
+  if(value == null || value === '') return [];
+  if(Array.isArray(value)) return value.flatMap(partyList);
+  const name = partyName(value);
+  return name ? [name] : [];
 }
 
 function termMatchesRow(row, term){
@@ -559,13 +841,17 @@ function rowMatchesRadar(row, radar){
 }
 
 async function fetchSERCOPAllPages(term, year, buyer, supplier, onProgress, force){
+  const query = sercopQuery(term, year, buyer, supplier);
+  if(query.shortSearch || query.badYear){
+    return {out:[], truncated:false, totalAvailable:0, skipped: query.shortSearch ? 'search' : 'year', query};
+  }
   let page = 1, pages = 1;
   const out = [];
   let lastData = null;
   do{
-    const params = new URLSearchParams({year, search:term, page});
-    if(buyer) params.set('buyer', buyer);
-    if(supplier) params.set('supplier', supplier);
+    const params = new URLSearchParams({year: query.year, search: query.search, page});
+    if(query.buyer) params.set('buyer', query.buyer);
+    if(query.supplier) params.set('supplier', query.supplier);
     lastData = await fetchCached(`${SERCOP_API}/search_ocds?${params.toString()}`, undefined, force);
     const rows = Array.isArray(lastData?.data) ? lastData.data : (Array.isArray(lastData) ? lastData : []);
     out.push(...rows);
@@ -582,26 +868,31 @@ async function fetchSERCOPAllPages(term, year, buyer, supplier, onProgress, forc
     seen.add(k);
     return true;
   });
-  return {out: deduped, truncated: pages > MAX_PAGES, totalAvailable: deduped.length};
+  return {out: deduped, truncated: pages > MAX_PAGES, totalAvailable: deduped.length, skipped:null, query};
 }
 
 async function fetchSERCOPByCPC(cpcCode, year, buyer, onProgress, force){
+  const query = sercopQuery(cpcCode, year, buyer, '');
+  if(query.shortSearch || query.badYear){
+    return {out:[], truncated:false, totalAvailable:0, skipped: query.shortSearch ? 'search' : 'year', query};
+  }
   let page = 1, pages = 1;
   const out = [];
   let lastData = null;
   do{
-    const params = new URLSearchParams({year, search:cpcCode, page});
-    if(buyer) params.set('buyer', buyer);
+    const params = new URLSearchParams({year: query.year, search: query.search, page});
+    if(query.buyer) params.set('buyer', query.buyer);
     lastData = await fetchCached(`${SERCOP_API}/search_ocds?${params.toString()}`, undefined, force);
     const rows = Array.isArray(lastData?.data) ? lastData.data : (Array.isArray(lastData) ? lastData : []);
-    const filtered = rows.filter(row => {
+    const exposesClass = rows.some(row => Array.isArray(row?.items) && row.items.length);
+    const filtered = exposesClass ? rows.filter(row => {
       const items = Array.isArray(row?.items) ? row.items : [];
       return items.some(it => {
         const classId = it?.classification?.id || '';
         const addClass = Array.isArray(it?.additionalClassifications) ? it.additionalClassifications.map(c => c.id) : [];
         return classId === cpcCode || addClass.includes(cpcCode);
       });
-    });
+    }) : rows;
     out.push(...filtered);
     pages = Number(lastData?.pages || lastData?.total_pages || 1) || 1;
     if(onProgress) onProgress({type:'page', term:`CPC ${cpcCode}`, page, pages, count:out.length});
@@ -616,7 +907,13 @@ async function fetchSERCOPByCPC(cpcCode, year, buyer, onProgress, force){
     seen.add(k);
     return true;
   });
-  return {out: deduped, truncated: pages > MAX_PAGES, totalAvailable: pages > MAX_PAGES ? (realTotal || pages * PAGE_SIZE) : deduped.length};
+  return {out: deduped, truncated: pages > MAX_PAGES, totalAvailable: pages > MAX_PAGES ? (realTotal || pages * PAGE_SIZE) : deduped.length, skipped:null, query};
+}
+
+function sercopSkipMessage(label, skipped){
+  if(skipped === 'search') return `"${label}": SERCOP exige al menos 3 caracteres`;
+  if(skipped === 'year') return `SERCOP solo admite años entre ${SERCOP_YEAR_MIN} y ${sercopCurrentYear()}`;
+  return '';
 }
 
 async function fetchBIDProjects(term, year){
@@ -1313,7 +1610,8 @@ async function runMonitor(){
       }
       if(wantsSource(radar, 'sercop')){
         try {
-          const {out} = await fetchSERCOPAllPages(term, radar.year, radar.buyer, radar.supplier, null, true);
+          const {out, skipped} = await fetchSERCOPAllPages(term, radar.year, radar.buyer, radar.supplier, null, true);
+          if(skipped) console.warn(`  [Monitor] ${sercopSkipMessage(term, skipped)}`);
           for(const raw of out){
             const row = normalizeSearchRow(raw, term);
             if(row && !allResults.has(row.ocid)) allResults.set(row.ocid, row);
@@ -1331,7 +1629,8 @@ async function runMonitor(){
     for(const cpc of cpcCodes){
       if(!wantsSource(radar, 'sercop')) continue;
       try {
-        const {out} = await fetchSERCOPByCPC(cpc, radar.year, radar.buyer, null, true);
+        const {out, skipped} = await fetchSERCOPByCPC(cpc, radar.year, radar.buyer, null, true);
+        if(skipped) console.warn(`  [Monitor] ${sercopSkipMessage('CPC '+cpc, skipped)}`);
         for(const raw of out){
           const row = normalizeSearchRow(raw, `CPC ${cpc}`);
           if(row && !allResults.has(row.ocid)) allResults.set(row.ocid, row);
@@ -1417,7 +1716,7 @@ function mergeDetail(payload){
   const rawValue = values[0] || null;
   const value = typeof rawValue==='number'?{amount:rawValue,currency:'USD'}:rawValue;
   const cpcs = [...new Set(allItems.flatMap(it=>[it?.classification?.id, ...(Array.isArray(it?.additionalClassifications)?it.additionalClassifications.map(c=>c.id):[])]).filter(Boolean).map(String))];
-  const supplierNames = [...new Set(awards.flatMap(a=>(a.suppliers||[]).map(s=>firstNonEmpty(s.name,s.identifier?.legalName,s.identifier?.id))).filter(Boolean))];
+  const supplierNames = [...new Set(awards.flatMap(a => partyList(a?.suppliers)))];
   const releaseDates = releases.flatMap(r=>[r.datePublished,r.publishedDate,r.releaseDate,r.date]);
   const tenderPublishDates = tenders.flatMap(t=>[t.datePublished,t.tenderPeriod?.startDate]);
   const publicationDate = earliestDate([...releaseDates,...tenderPublishDates]);
@@ -1448,7 +1747,12 @@ function getRowTitle(row){ return fixEncoding(String(firstNonEmpty(row?.title, r
 function getRowDescription(row){ return fixEncoding(String(firstNonEmpty(row?.description, row?.tender?.description) ?? '')); }
 function getRowDate(row){ return String(firstNonEmpty(row?.datePublished, row?.publishedDate, row?.releaseDate, row?.date, row?.tender?.datePublished, row?.tender?.tenderPeriod?.startDate) ?? ''); }
 function getRowModality(row){ return String(firstNonEmpty(row?.internal_type, row?.procurementMethodDetails, row?.tender?.procurementMethodDetails, row?.tender?.procurementMethod, row?.method) ?? '—'); }
-function getBuyerLabel(row){ return fixEncoding(String(firstNonEmpty(row?.buyerName, row?.buyer_name, row?.buyer?.name, row?.entidad, row?.buyer?.identifier?.legalName, row?.buyer?.identifier?.id, row?.buyerId) ?? '—')); }
+function getBuyerLabel(row){
+  return fixEncoding(String(firstNonEmpty(
+    partyName(row?.buyerName), partyName(row?.buyer_name), partyName(row?.buyer),
+    partyName(row?.entidad), row?.buyer?.identifier?.legalName, row?.buyer?.identifier?.id, row?.buyerId
+  ) ?? '—'));
+}
 
 const OCDS_MODALITY_RE = /^(SIE|CPC|LICO|CE|CO|ICQ|SNCP|SGP|ICAP|CGUV|AP)-/;
 function procCodeTail(ocid){
@@ -1469,6 +1773,10 @@ function normalizeSearchRow(row, term){
   }
   row.ocid = ocid;
   row.source = row.source || 'SERCOP';
+  if(!row.buyerName){
+    const buyer = partyName(row.buyer);
+    if(buyer) row.buyerName = buyer;
+  }
   const title = String(row.title ?? '').trim();
   const desc = String(row.description ?? '').trim();
   const tail = procCodeTail(ocid);
@@ -1708,9 +2016,7 @@ function getMercado(year, cpc, entidad){
       d = {
         publicationDate: String(firstNonEmpty(raw.publicationDate, raw.date, raw.year) ?? ''),
         cpcs: Array.isArray(raw.cpcs) ? raw.cpcs : [],
-        supplierNames: Array.isArray(raw.suppliers)
-          ? raw.suppliers.map(s => String(firstNonEmpty(s?.name, s?.identifier?.legalName, s?.identifier?.id) ?? '')).filter(Boolean)
-          : [],
+        supplierNames: [...new Set([...partyList(raw.suppliers), ...partyList(raw.single_provider)])],
         value: amount > 0 ? {amount, currency:'USD'} : null,
         modalidad: String(firstNonEmpty(raw.modalidad, raw.internal_type) ?? '')
       };
@@ -1884,6 +2190,16 @@ async function handleSearch(req, res, params){
   const merged = new Map();
   const sourceErrors = [];
   const seenTails = new Map();
+  let sercopPartyWarned = false;
+  function warnSercopParties(query){
+    if(sercopPartyWarned || !query) return;
+    const bits = [];
+    if(query.shortBuyer) bits.push('comprador');
+    if(query.shortSupplier) bits.push('proveedor');
+    if(!bits.length) return;
+    sercopPartyWarned = true;
+    send('warning', {message:`${bits.join(' y ')} omitido: SERCOP exige al menos 3 caracteres`});
+  }
 
   function mergeSERCOPRow(row, radarId, send){
     const tail = procCodeTail(row.ocid);
@@ -1947,7 +2263,9 @@ async function handleSearch(req, res, params){
 
       if(wantsSource(radar, 'sercop')){
         try {
-          const {out, truncated, totalAvailable} = await fetchSERCOPAllPages(term, radar.year, radar.buyer, radar.supplier, (prog) => send('progress', prog), true);
+          const {out, truncated, totalAvailable, skipped, query} = await fetchSERCOPAllPages(term, radar.year, radar.buyer, radar.supplier, (prog) => send('progress', prog), true);
+          if(skipped) send('warning', {message: sercopSkipMessage(term, skipped)});
+          else warnSercopParties(query);
           if(truncated) send('warning', {message:`"${term}": mostrando primeras ${MAX_PAGES} paginas de resultados`, totalAvailable});
           for(const raw of out){
             const row = normalizeSearchRow(raw, term);
@@ -1986,7 +2304,9 @@ async function handleSearch(req, res, params){
 
       if(wantsSource(radar, 'sercop')){
         try {
-          const {out, truncated, totalAvailable} = await fetchSERCOPByCPC(cpc, radar.year, radar.buyer, (prog) => send('progress', prog), true);
+          const {out, truncated, totalAvailable, skipped, query} = await fetchSERCOPByCPC(cpc, radar.year, radar.buyer, (prog) => send('progress', prog), true);
+          if(skipped) send('warning', {message: sercopSkipMessage(`CPC ${cpc}`, skipped)});
+          else warnSercopParties(query);
           if(truncated) send('warning', {message:`"CPC ${cpc}": mostrando primeras ${MAX_PAGES} paginas de resultados`, totalAvailable});
           for(const raw of out){
             const row = normalizeSearchRow(raw, `CPC ${cpc}`);
@@ -2562,7 +2882,9 @@ const server = http.createServer(async (req, res) => {
       const q = (params.q || '').trim();
       const year = params.year || String(new Date().getFullYear());
       const term = (params.term || '').trim();
-      if(!q) return json(res, 400, {error:'q (entidad) required'});
+      if(q.length < 3) return json(res, 400, {error:'la entidad debe tener al menos 3 caracteres'});
+      if(!sercopKeyword(term)) return json(res, 400, {error:'SERCOP exige una palabra clave de al menos 3 caracteres'});
+      if(!sercopYear(year)) return json(res, 400, {error:`SERCOP solo admite años entre ${SERCOP_YEAR_MIN} y ${sercopCurrentYear()}`});
       let {out, totalAvailable} = {out:[], totalAvailable:0};
       try{
         const r = await fetchSERCOPAllPages(term, year, q, undefined, undefined, true);
