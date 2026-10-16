@@ -536,7 +536,7 @@ function requestOnce(urlObj, opts, target){
       method: opts.method || 'GET',
       headers,
       lookup: lookupPinned(target.address, target.family),
-      timeout: CONNECT_TIMEOUT_MS,
+      timeout: Math.max(2000, Number(opts.connectTimeout) || CONNECT_TIMEOUT_MS),
       autoSelectFamily: false,
       agent: false
     }, (res) => {
@@ -654,9 +654,11 @@ async function fetchOnceWithFailover(url, opts, redirects = 0){
 
 async function fetchWithRetry(url, opts={}, retries=MAX_RETRIES){
   const okStatuses = Array.isArray(opts.okStatuses) ? opts.okStatuses : [];
+  const tries = Number.isInteger(opts.retries) ? opts.retries : retries;
   const fetchOpts = {...opts};
   delete fetchOpts.okStatuses;
-  return enqueueExternalFetch(() => fetchWithRetryUnlocked(url, fetchOpts, okStatuses, retries));
+  delete fetchOpts.retries;
+  return enqueueExternalFetch(() => fetchWithRetryUnlocked(url, fetchOpts, okStatuses, tries));
 }
 
 async function fetchWithRetryUnlocked(url, fetchOpts, okStatuses, retries){
@@ -827,6 +829,52 @@ function termMatchesRow(row, term){
   return textContainsTerm(rowSearchText(row), term);
 }
 
+function sercopDistinctTokens(term){
+  const phrase = normTxt(term).trim().replace(/\s+/g, ' ');
+  return termTokens(term).filter(token => token.length >= 6 && token !== phrase);
+}
+
+function sercopQueryVariants(term){
+  const phrase = String(term || '').trim().replace(/\s+/g, ' ');
+  const variants = [];
+  if(phrase) variants.push(phrase);
+  const seen = new Set(variants.map(v => normTxt(v)));
+  for(const token of sercopDistinctTokens(term)){
+    if(seen.has(token)) continue;
+    seen.add(token);
+    variants.push(token);
+  }
+  return variants;
+}
+
+function sercopTextMatches(row, term){
+  const text = rowSearchText(row);
+  if(textContainsTerm(text, term)) return true;
+  return sercopDistinctTokens(term).some(token => textContainsTerm(text, token));
+}
+
+function sercopSummaryIsCode(row){
+  return String(row?.description ?? '').trim().length < 12;
+}
+
+function acceptSercopApiHit(row, term){
+  return sercopTextMatches(row, term) || sercopSummaryIsCode(row);
+}
+
+function tagSercopTerm(row, term){
+  const tagged = Array.isArray(row._matchedTerms) ? row._matchedTerms : [];
+  if(!tagged.some(t => normTxt(t) === normTxt(term))) tagged.push(term);
+  row._matchedTerms = tagged;
+  return row;
+}
+
+function sercopRowRelevant(row, term){
+  if(sercopTextMatches(row, term)) return true;
+  if(!sercopSummaryIsCode(row)) return false;
+  const tagged = Array.isArray(row?._matchedTerms) ? row._matchedTerms : [];
+  return tagged.some(t => normTxt(t) === normTxt(term));
+}
+
 function ncoMatchesTerm(row, term){
   return textContainsTerm([row?.title, row?.modalidad, row?.internal_type].filter(Boolean).join(' | '), term);
 }
@@ -837,11 +885,13 @@ function rowMatchesRadar(row, radar){
   if(!wantsSource(radar, src)) return false;
   const terms = splitRadarTerms(radar.search);
   if(!terms.length) return true;
-  return terms.some(term => src === 'nco' ? ncoMatchesTerm(row, term) : termMatchesRow(row, term));
+  if(src === 'nco') return terms.some(term => ncoMatchesTerm(row, term));
+  if(src === 'sercop') return terms.some(term => sercopRowRelevant(row, term));
+  return terms.some(term => termMatchesRow(row, term));
 }
 
-async function fetchSERCOPAllPages(term, year, buyer, supplier, onProgress, force){
-  const query = sercopQuery(term, year, buyer, supplier);
+async function fetchSERCOPPages(search, year, buyer, supplier, onProgress, force, progressTerm){
+  const query = sercopQuery(search, year, buyer, supplier);
   if(query.shortSearch || query.badYear){
     return {out:[], truncated:false, totalAvailable:0, skipped: query.shortSearch ? 'search' : 'year', query};
   }
@@ -852,23 +902,53 @@ async function fetchSERCOPAllPages(term, year, buyer, supplier, onProgress, forc
     const params = new URLSearchParams({year: query.year, search: query.search, page});
     if(query.buyer) params.set('buyer', query.buyer);
     if(query.supplier) params.set('supplier', query.supplier);
-    lastData = await fetchCached(`${SERCOP_API}/search_ocds?${params.toString()}`, undefined, force);
+    lastData = await fetchCached(`${SERCOP_API}/search_ocds?${params.toString()}`, {retries: 1}, force);
     const rows = Array.isArray(lastData?.data) ? lastData.data : (Array.isArray(lastData) ? lastData : []);
     out.push(...rows);
     pages = Number(lastData?.pages || lastData?.total_pages || 1) || 1;
-    if(onProgress) onProgress({type:'page', term, page, pages, count:out.length});
+    if(onProgress) onProgress({type:'page', term: progressTerm || search, page, pages, count:out.length});
     page++;
     if(page <= pages && page <= MAX_PAGES) await sleep(PAGE_DELAY);
   } while(page <= pages && page <= MAX_PAGES);
-  const relevant = out.filter(r => termMatchesRow(r, term));
+  return {out, truncated: pages > MAX_PAGES, totalAvailable: out.length, skipped:null, query};
+}
+
+async function fetchSERCOPAllPages(term, year, buyer, supplier, onProgress, force){
+  const variants = sercopQueryVariants(term);
   const seen = new Set();
-  const deduped = relevant.filter(r => {
-    const k = String(r?.ocid || JSON.stringify([r?.title, r?.buyer, r?.date]));
-    if(seen.has(k)) return false;
-    seen.add(k);
-    return true;
-  });
-  return {out: deduped, truncated: pages > MAX_PAGES, totalAvailable: deduped.length, skipped:null, query};
+  const out = [];
+  let truncated = false;
+  let query = null;
+  let skipped = null;
+  let lastErr = null;
+  for(const variant of variants){
+    let page;
+    try{
+      page = await fetchSERCOPPages(variant, year, buyer, supplier, onProgress, force, term);
+    }catch(e){
+      lastErr = e;
+      console.warn(`  SERCOP variante "${variant}" de "${term}": ${e.message}`);
+      continue;
+    }
+    if(!query) query = page.query;
+    if(page.skipped === 'year') return {out:[], truncated:false, totalAvailable:0, skipped:'year', query: page.query};
+    if(page.skipped){
+      skipped = skipped || page.skipped;
+      continue;
+    }
+    skipped = null;
+    if(page.truncated) truncated = true;
+    for(const row of page.out){
+      if(!acceptSercopApiHit(row, term)) continue;
+      const k = String(row?.ocid || JSON.stringify([row?.title, row?.buyer, row?.date]));
+      if(seen.has(k)) continue;
+      seen.add(k);
+      out.push(tagSercopTerm(row, term));
+    }
+  }
+  if(!out.length && skipped && !lastErr) return {out, truncated:false, totalAvailable:0, skipped, query};
+  if(!out.length && lastErr) throw lastErr;
+  return {out, truncated, totalAvailable: out.length, skipped:null, query};
 }
 
 async function fetchSERCOPByCPC(cpcCode, year, buyer, onProgress, force){
@@ -882,7 +962,7 @@ async function fetchSERCOPByCPC(cpcCode, year, buyer, onProgress, force){
   do{
     const params = new URLSearchParams({year: query.year, search: query.search, page});
     if(query.buyer) params.set('buyer', query.buyer);
-    lastData = await fetchCached(`${SERCOP_API}/search_ocds?${params.toString()}`, undefined, force);
+    lastData = await fetchCached(`${SERCOP_API}/search_ocds?${params.toString()}`, {retries: 1}, force);
     const rows = Array.isArray(lastData?.data) ? lastData.data : (Array.isArray(lastData) ? lastData : []);
     const exposesClass = rows.some(row => Array.isArray(row?.items) && row.items.length);
     const filtered = exposesClass ? rows.filter(row => {
@@ -928,7 +1008,7 @@ async function fetchBIDProjects(term, year){
   if(data?.success === false) throw new Error(data?.error?.message || `BID rejected "${term}"`);
   const records = Array.isArray(data?.result?.records) ? data.result.records : [];
   return records
-    .filter(x => { if(!year) return true; const y = String(x?.apprvl_dt||'').slice(0,4); return !y || Number(y) <= Number(year); })
+    .filter(x => { if(!year) return true; return String(x?.apprvl_dt||'').slice(0,4) === String(year); })
     .map(x => {
       const code = String(x.oper_num || x._id || ('BID-'+Math.random())).trim();
       const amount = Number(x.orig_apprvd_useq_amnt || x.totl_cost_orig || 0);
@@ -1016,9 +1096,17 @@ function normalizeNCORow(row, term){
   };
 }
 
+let ncoUnavailableUntil = 0;
+const NCO_DOWN_MS = 10 * 60 * 1000;
+
+function ncoIsDownError(e){
+  return /ETIMEDOUT|ECONN|ENOTFOUND|EAI_AGAIN|ABORT|conexión fallida|tiempo de conexión/i.test(`${e?.code || ''} ${e?.message || ''}`);
+}
+
 async function fetchNCONeeds(term, year, buyer){
   const q = String(term || '').trim();
   if(q.length < 5) return {out: [], totalAvailable: 0, skipped: true};
+  if(Date.now() < ncoUnavailableUntil) return {out: [], totalAvailable: 0, unavailable: true};
   const body = new URLSearchParams({
     draw: '1',
     start: '0',
@@ -1039,11 +1127,19 @@ async function fetchNCONeeds(term, year, buyer){
     body.set(`columns[${i}][search][regex]`, 'false');
   });
   body.set('columns[5][search][value]', '384');
-  const resp = await fetchWithRetry(NCO_LIST_URL, {
-    method: 'POST',
-    headers: {'Content-Type':'application/x-www-form-urlencoded; charset=UTF-8'},
-    body: body.toString()
-  });
+  let resp;
+  try{
+    resp = await fetchWithRetry(NCO_LIST_URL, {
+      method: 'POST',
+      headers: {'Content-Type':'application/x-www-form-urlencoded; charset=UTF-8'},
+      body: body.toString(),
+      connectTimeout: 4000,
+      retries: 0
+    });
+  }catch(e){
+    if(ncoIsDownError(e)) ncoUnavailableUntil = Date.now() + NCO_DOWN_MS;
+    throw e;
+  }
   const data = await resp.json();
   const now = new Date();
   const rows = Array.isArray(data?.data) ? data.data : [];
@@ -1242,13 +1338,15 @@ async function fetchUNDPNotices(term, year){
           'User-Agent': UNDP_USER_AGENT,
           'Referer': UNDP_SEARCH_URL
         },
-        body
+        body,
+        signal: AbortSignal.timeout(8000)
       });
       if(!resp.ok) throw new Error(`HTTP ${resp.status}`);
       html = await resp.text();
       break;
     }catch(e){
-      if(attempt === MAX_RETRIES) throw e;
+      const timedOut = e?.name === 'TimeoutError' || e?.name === 'AbortError';
+      if(attempt === MAX_RETRIES || timedOut) throw e;
       await sleep(1200 * Math.pow(2, attempt));
     }
   }
@@ -1593,6 +1691,18 @@ async function runMonitor(){
     const seenSet = new Set(getSeen(radar.id));
     const allResults = new Map();
     for(const term of terms){
+      if(wantsSource(radar, 'sercop')){
+        try {
+          const {out, skipped} = await fetchSERCOPAllPages(term, radar.year, radar.buyer, radar.supplier, null, true);
+          if(skipped) console.warn(`  [Monitor] ${sercopSkipMessage(term, skipped)}`);
+          for(const raw of out){
+            const row = normalizeSearchRow(raw, term);
+            if(row && !allResults.has(row.ocid)) allResults.set(row.ocid, row);
+          }
+        } catch(e){ console.error(`  [Monitor] SERCOP error (${term}):`, e.message); }
+      }
+    }
+    for(const term of terms){
       if(wantsSource(radar, 'undp')){
         try {
           const rows = await fetchUNDPNotices(term, radar.year);
@@ -1608,23 +1718,13 @@ async function runMonitor(){
           for(const row of out) if(row && !allResults.has(row.ocid)) allResults.set(row.ocid, row);
         } catch(e){ console.error(`  [Monitor] NCO error (${term}):`, e.message); }
       }
-      if(wantsSource(radar, 'sercop')){
-        try {
-          const {out, skipped} = await fetchSERCOPAllPages(term, radar.year, radar.buyer, radar.supplier, null, true);
-          if(skipped) console.warn(`  [Monitor] ${sercopSkipMessage(term, skipped)}`);
-          for(const raw of out){
-            const row = normalizeSearchRow(raw, term);
-            if(row && !allResults.has(row.ocid)) allResults.set(row.ocid, row);
-          }
-        } catch(e){ console.error(`  [Monitor] SERCOP error (${term}):`, e.message); }
-      }
       if(wantsSource(radar, 'bid')){
         try {
           const rows = await fetchBIDProjects(term, radar.year);
           for(const row of rows) if(row?.ocid && !allResults.has(row.ocid)) allResults.set(row.ocid, row);
         } catch(e){ console.error(`  [Monitor] BID error (${term}):`, e.message); }
       }
-      await sleep(TERM_DELAY);
+      if(wantsSource(radar, 'undp') || wantsSource(radar, 'nco') || wantsSource(radar, 'bid')) await sleep(TERM_DELAY);
     }
     for(const cpc of cpcCodes){
       if(!wantsSource(radar, 'sercop')) continue;
@@ -2171,19 +2271,35 @@ async function handleSearch(req, res, params){
   const aOrigin = allowedOrigin(req.headers.origin);
   const sseHeaders = {
     'Content-Type':'text/event-stream',
-    'Cache-Control':'no-cache',
-    'Connection':'keep-alive'
+    'Cache-Control':'no-cache, no-transform',
+    'Connection':'keep-alive',
+    'X-Accel-Buffering':'no'
   };
   if(aOrigin) sseHeaders['Access-Control-Allow-Origin'] = aOrigin;
+  if(res.socket){
+    res.socket.setNoDelay(true);
+    res.socket.setTimeout(0);
+  }
   res.writeHead(200, sseHeaders);
+  if(typeof res.flushHeaders === 'function') res.flushHeaders();
 
+  let streamClosed = false;
   const send = (event, data) => {
+    if(streamClosed) return;
     res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
   };
+  const heartbeat = setInterval(() => {
+    try{ res.write(': ping\n\n'); }catch(_){}
+  }, 4000);
 
   const terms = splitRadarTerms(radar.search);
   const cpcCodes = splitRadarTerms(radar.cpcs);
-  if(!terms.length && !cpcCodes.length){ send('error_msg', {message:'No hay palabras clave validas'}); res.end(); return; }
+  if(!terms.length && !cpcCodes.length){
+    send('error_msg', {message:'No hay palabras clave validas'});
+    clearInterval(heartbeat);
+    res.end();
+    return;
+  }
 
   send('start', {terms, cpcCodes, year:radar.year, source:radar.source});
 
@@ -2224,44 +2340,21 @@ async function handleSearch(req, res, params){
     return true;
   }
 
+  const totalSteps = terms.length + cpcCodes.length;
+  let ncoDownWarned = false;
+
+  function publishRow(row){
+    if(!row?.ocid || merged.has(row.ocid)) return;
+    merged.set(row.ocid, row);
+    send('result', row);
+  }
+
   try {
     enrichBudget = 40;
-    for(let ti = 0; ti < terms.length; ti++){
-      const term = terms[ti];
-      send('term_start', {term, index:ti, total:terms.length + cpcCodes.length});
-
-      if(wantsSource(radar, 'undp')){
-        try {
-          const undpRows = await fetchUNDPNotices(term, radar.year);
-          for(const raw of undpRows){
-            const row = normalizeSearchRow(raw, term);
-            if(!row) continue;
-            saveProcess(row, radarId);
-            if(!merged.has(row.ocid)){ merged.set(row.ocid, row); send('result', row); }
-          }
-        } catch(e){
-          console.error(`  UNDP error (${term}):`, e.message);
-          sourceErrors.push(`UNDP (${term}): ${e.message}`);
-        }
-      }
-
-      if(wantsSource(radar, 'nco')){
-        try {
-          const {out, totalAvailable, skipped} = await fetchNCONeeds(term, radar.year, radar.buyer);
-          if(skipped) send('warning', {message:`"${term}": NCO requiere minimo 5 caracteres`});
-          if(out.length && totalAvailable > out.length) send('warning', {message:`"${term}": NCO devolvio ${totalAvailable} coincidencias; mostrando ${out.length} relevantes vigentes del ano configurado`});
-          for(const row of out){
-            saveProcess(row, radarId);
-            if(row?._detail) saveDetail(row.ocid, row._detail);
-            if(row?.ocid && !merged.has(row.ocid)){ merged.set(row.ocid, row); send('result', row); }
-          }
-        } catch(e){
-          console.error(`  NCO error (${term}):`, e.message);
-          sourceErrors.push(`NCO (${term}): ${e.message}`);
-        }
-      }
-
-      if(wantsSource(radar, 'sercop')){
+    if(wantsSource(radar, 'sercop')){
+      for(let ti = 0; ti < terms.length; ti++){
+        const term = terms[ti];
+        send('term_start', {term, index:ti, total:totalSteps});
         try {
           const {out, truncated, totalAvailable, skipped, query} = await fetchSERCOPAllPages(term, radar.year, radar.buyer, radar.supplier, (prog) => send('progress', prog), true);
           if(skipped) send('warning', {message: sercopSkipMessage(term, skipped)});
@@ -2271,38 +2364,16 @@ async function handleSearch(req, res, params){
             const row = normalizeSearchRow(raw, term);
             if(!row) continue;
             saveProcess(row, radarId);
-            scheduleEnrich(row, send);
-            if(!merged.has(row.ocid)){ merged.set(row.ocid, row); send('result', row); }
+            publishRow(row);
           }
         } catch(e){
           console.error(`  SERCOP error (${term}):`, e.message);
           sourceErrors.push(`SERCOP (${term}): ${e.message}`);
         }
       }
-
-      if(wantsSource(radar, 'bid')){
-        try {
-          const bidRows = await fetchBIDProjects(term, radar.year);
-          for(const row of bidRows){
-            saveProcess(row, radarId);
-            if(row?.ocid && !merged.has(row.ocid)){ merged.set(row.ocid, row); send('result', row); }
-          }
-        } catch(e){
-          console.error(`  BID error (${term}):`, e.message);
-          sourceErrors.push(`BID (${term}): ${e.message}`);
-        }
-      }
-
-      send('term_done', {term, count: merged.size});
-      if(ti < terms.length - 1 || cpcCodes.length) await sleep(TERM_DELAY);
-    }
-
-    for(let ci = 0; ci < cpcCodes.length; ci++){
-      const cpc = cpcCodes[ci];
-      const idx = terms.length + ci;
-      send('term_start', {term:`CPC ${cpc}`, index:idx, total:terms.length + cpcCodes.length});
-
-      if(wantsSource(radar, 'sercop')){
+      for(let ci = 0; ci < cpcCodes.length; ci++){
+        const cpc = cpcCodes[ci];
+        send('term_start', {term:`CPC ${cpc}`, index:terms.length + ci, total:totalSteps});
         try {
           const {out, truncated, totalAvailable, skipped, query} = await fetchSERCOPByCPC(cpc, radar.year, radar.buyer, (prog) => send('progress', prog), true);
           if(skipped) send('warning', {message: sercopSkipMessage(`CPC ${cpc}`, skipped)});
@@ -2312,17 +2383,94 @@ async function handleSearch(req, res, params){
             const row = normalizeSearchRow(raw, `CPC ${cpc}`);
             if(!row) continue;
             saveProcess(row, radarId);
-            scheduleEnrich(row, send);
-            if(!merged.has(row.ocid)){ merged.set(row.ocid, row); send('result', row); }
+            publishRow(row);
           }
         } catch(e){
           console.error(`  SERCOP CPC error (${cpc}):`, e.message);
           sourceErrors.push(`SERCOP CPC (${cpc}): ${e.message}`);
         }
       }
+    }
 
-      send('term_done', {term:`CPC ${cpc}`, count: merged.size});
-      if(ci < cpcCodes.length - 1) await sleep(TERM_DELAY);
+    const slow = wantsSource(radar, 'undp') || wantsSource(radar, 'nco') || wantsSource(radar, 'bid');
+    let slowFinished = !slow;
+    const slowWork = (async () => {
+      const slowDeadline = Date.now() + 5000;
+      let slowSkipped = false;
+      for(let ti = 0; ti < terms.length; ti++){
+        if(streamClosed) return;
+        const term = terms[ti];
+        if(!wantsSource(radar, 'sercop')) send('term_start', {term, index:ti, total:totalSteps});
+        if(slow && Date.now() >= slowDeadline){
+          if(!slowSkipped){
+            slowSkipped = true;
+            send('warning', {message:'Otras fuentes tardaron demasiado; se muestran los procesos de SERCOP'});
+          }
+          send('term_done', {term, count: merged.size});
+          continue;
+        }
+
+        if(wantsSource(radar, 'undp')){
+          try {
+            const undpRows = await fetchUNDPNotices(term, radar.year);
+            for(const raw of undpRows){
+              const row = normalizeSearchRow(raw, term);
+              if(!row) continue;
+              saveProcess(row, radarId);
+              publishRow(row);
+            }
+          } catch(e){
+            console.error(`  UNDP error (${term}):`, e.message);
+            sourceErrors.push(`UNDP (${term}): ${e.message}`);
+          }
+        }
+
+        if(wantsSource(radar, 'nco')){
+          try {
+            const {out, totalAvailable, skipped, unavailable} = await fetchNCONeeds(term, radar.year, radar.buyer);
+            if(unavailable){
+              if(!ncoDownWarned){
+                ncoDownWarned = true;
+                send('warning', {message:'NCO no responde en este momento; SERCOP y el resto de fuentes siguen'});
+              }
+            } else {
+              if(skipped) send('warning', {message:`"${term}": NCO requiere minimo 5 caracteres`});
+              if(out.length && totalAvailable > out.length) send('warning', {message:`"${term}": NCO devolvio ${totalAvailable} coincidencias; mostrando ${out.length} relevantes vigentes del ano configurado`});
+              for(const row of out){
+                saveProcess(row, radarId);
+                if(row?._detail) saveDetail(row.ocid, row._detail);
+                publishRow(row);
+              }
+            }
+          } catch(e){
+            console.error(`  NCO error (${term}):`, e.message);
+            sourceErrors.push(`NCO (${term}): ${e.message}`);
+          }
+        }
+
+        if(wantsSource(radar, 'bid')){
+          try {
+            const bidRows = await fetchBIDProjects(term, radar.year);
+            for(const row of bidRows){
+              saveProcess(row, radarId);
+              publishRow(row);
+            }
+          } catch(e){
+            console.error(`  BID error (${term}):`, e.message);
+            sourceErrors.push(`BID (${term}): ${e.message}`);
+          }
+        }
+
+        send('term_done', {term, count: merged.size});
+      }
+      slowFinished = true;
+    })();
+    if(slow) await Promise.race([slowWork, sleep(5000)]);
+    else await slowWork;
+    if(slow && !slowFinished) send('warning', {message:'Otras fuentes tardaron demasiado; se muestran los procesos de SERCOP'});
+
+    if(wantsSource(radar, 'sercop')){
+      for(const cpc of cpcCodes) send('term_done', {term:`CPC ${cpc}`, count: merged.size});
     }
 
     const results = [...merged.values()].filter(Boolean).sort((a,b) => String(getRowDate(b)).localeCompare(String(getRowDate(a))));
@@ -2331,8 +2479,13 @@ async function handleSearch(req, res, params){
       totalAvailable: results.length,
       warnings: sourceErrors.length ? [`Errores: ${sourceErrors.join(' · ')}`] : []
     });
+    streamClosed = true;
   } catch(e){
     send('error_msg', {message: e.message});
+    streamClosed = true;
+  } finally {
+    streamClosed = true;
+    clearInterval(heartbeat);
   }
 
   res.end();

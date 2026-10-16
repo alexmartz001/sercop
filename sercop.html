@@ -1635,6 +1635,49 @@ function resetResultsForRadar(){
   renderStats();
 }
 
+function emitSseBlock(block, onEvent){
+  let event = 'message';
+  const dataLines = [];
+  for(const line of String(block || '').split('\n')){
+    if(!line || line.startsWith(':')) continue;
+    if(line.startsWith('event:')) event = line.slice(6).trim();
+    else if(line.startsWith('data:')) dataLines.push(line.slice(5).trim());
+  }
+  if(!dataLines.length) return;
+  try{ onEvent(event, JSON.parse(dataLines.join(''))); }
+  catch(_){}
+}
+
+async function readSearchStream(url, signal, onEvent){
+  const resp = await fetch(url, {
+    credentials: 'same-origin',
+    signal,
+    headers: authHeaders({Accept:'text/event-stream'})
+  });
+  if(handleAuthFailure(resp.status)){
+    const err = new Error('auth');
+    err.name = 'AbortError';
+    throw err;
+  }
+  if(!resp.ok || !resp.body) throw new Error('HTTP ' + resp.status);
+  const reader = resp.body.getReader();
+  const decoder = new TextDecoder();
+  let buf = '';
+  while(true){
+    const {done, value} = await reader.read();
+    buf += decoder.decode(value || new Uint8Array(), {stream: !done});
+    let idx;
+    while((idx = buf.indexOf('\n\n')) >= 0){
+      emitSseBlock(buf.slice(0, idx), onEvent);
+      buf = buf.slice(idx + 2);
+    }
+    if(done){
+      if(buf.trim()) emitSseBlock(buf, onEvent);
+      break;
+    }
+  }
+}
+
 async function doSearch(){
   const r = S.radares.find(x=>x.id===S.activeRadarId);
   if(!r) return;
@@ -1694,84 +1737,72 @@ async function doSearch(){
     const cpcs = parseCpcCodes(r.cpcs).join(',');
     let url = `/api/search?radarId=${encodeURIComponent(r.id)}`;
     if(cpcs) url += `&cpcs=${encodeURIComponent(cpcs)}`;
-    const evtSource = new EventSource(withAuth(url));
-    S.activeSearchSource = evtSource;
-
-    evtSource.addEventListener('term_start', e => {
-      if(myToken !== searchToken || S.activeRadarId !== searchRadarId) return;
-      const d = JSON.parse(e.data);
-      $('countText').textContent = `buscando "${d.term}" (${d.index+1}/${d.total})…`;
-    });
-
-    evtSource.addEventListener('result', e => {
-      if(myToken !== searchToken || S.activeRadarId !== searchRadarId) return;
-      const row = JSON.parse(e.data);
-      if(row?.ocid && !merged.has(row.ocid)){
-        merged.set(row.ocid, row);
-        S.allResults = [...merged.values()].sort((a,b) => String(getRowDate(b)).localeCompare(String(getRowDate(a))));
-        S.currentTotal = S.allResults.length;
-        S.currentPages = Math.max(1, Math.ceil(S.currentTotal / PAGE_SIZE));
-        $('countText').textContent = S.currentTotal;
-        if(S.currentPage === 1) goToPage(1);
-      }
-    });
-
-    evtSource.addEventListener('done', e => {
-      if(myToken !== searchToken || S.activeRadarId !== searchRadarId) return;
-      const d = JSON.parse(e.data);
-      S.allResults = [...merged.values()].sort((a,b) => String(getRowDate(b)).localeCompare(String(getRowDate(a))));
-      S.currentTotal = S.allResults.length;
-      S.currentPages = Math.max(1, Math.ceil(S.currentTotal / PAGE_SIZE));
-      if(d.warnings?.length) showErr(d.warnings.map(esc).join('<br>'));
-      goToPage(1);
-      evtSource.close();
-      if(S.activeSearchSource === evtSource) S.activeSearchSource = null;
-    });
-
-    evtSource.addEventListener('result_update', e => {
-      if(myToken !== searchToken || S.activeRadarId !== searchRadarId) return;
+    const ctrl = new AbortController();
+    const stream = {close(){ try{ ctrl.abort(); }catch(_){} }};
+    S.activeSearchSource = stream;
+    let sawDone = false;
+    let attempt = 0;
+    let failed = false;
+    while(attempt < 2 && !sawDone && myToken === searchToken && S.activeRadarId === searchRadarId){
+      attempt++;
       try{
-        const u = JSON.parse(e.data);
-        const row = merged.get(u.ocid) || S.allResults.find(r => r.ocid === u.ocid);
-        if(!row) return;
-        if(u.title) row.title = u.title;
-        if(u.description) row.description = u.description;
-        if(u.buyerName) row.buyerName = u.buyerName;
-        const wasMerged = merged.has(u.ocid);
-        if(wasMerged) merged.set(u.ocid, row);
-        S.allResults = [...merged.values()].sort((a,b) => String(getRowDate(b)).localeCompare(String(getRowDate(a))));
-        if(S.currentPage && document.getElementById('radarResults').style.display !== 'none') goToPage(S.currentPage);
-      }catch(_){}
-    });
-
-    evtSource.addEventListener('warning', e => {
-      if(myToken !== searchToken || S.activeRadarId !== searchRadarId) return;
-      const d = JSON.parse(e.data);
-      toast(d.message || 'Advertencia del servidor', 'warning', 5000);
-    });
-
-    evtSource.addEventListener('error_msg', e => {
-      if(myToken !== searchToken || S.activeRadarId !== searchRadarId) return;
-      const d = JSON.parse(e.data);
-      showErr(esc(d.message));
-      evtSource.close();
-      if(S.activeSearchSource === evtSource) S.activeSearchSource = null;
-    });
-
-    evtSource.onerror = () => {
-      if(myToken !== searchToken || S.activeRadarId !== searchRadarId) return;
-      if(merged.size > 0){
-        S.allResults = [...merged.values()].sort((a,b) => String(getRowDate(b)).localeCompare(String(getRowDate(a))));
-        S.currentTotal = S.allResults.length;
-        S.currentPages = Math.max(1, Math.ceil(S.currentTotal / PAGE_SIZE));
-        goToPage(1);
-      } else {
-        $('countText').textContent = '0';
-        showErr('Error de conexión con el servidor de búsqueda.');
+        await readSearchStream(withAuth(url), ctrl.signal, (event, data) => {
+          if(myToken !== searchToken || S.activeRadarId !== searchRadarId) return;
+          if(event === 'term_start'){
+            $('countText').textContent = `buscando "${data.term}" (${data.index+1}/${data.total})…`;
+          } else if(event === 'result' && data?.ocid && !merged.has(data.ocid)){
+            merged.set(data.ocid, data);
+            S.allResults = [...merged.values()].sort((a,b) => String(getRowDate(b)).localeCompare(String(getRowDate(a))));
+            S.currentTotal = S.allResults.length;
+            S.currentPages = Math.max(1, Math.ceil(S.currentTotal / PAGE_SIZE));
+            $('countText').textContent = S.currentTotal;
+            if(S.currentPage === 1) goToPage(1);
+          } else if(event === 'result_update'){
+            const row = merged.get(data.ocid) || S.allResults.find(x => x.ocid === data.ocid);
+            if(!row) return;
+            if(data.title) row.title = data.title;
+            if(data.description) row.description = data.description;
+            if(data.buyerName) row.buyerName = data.buyerName;
+            if(merged.has(data.ocid)) merged.set(data.ocid, row);
+            S.allResults = [...merged.values()].sort((a,b) => String(getRowDate(b)).localeCompare(String(getRowDate(a))));
+            if(S.currentPage && document.getElementById('radarResults').style.display !== 'none') goToPage(S.currentPage);
+          } else if(event === 'warning'){
+            toast(data.message || 'Advertencia del servidor', 'warning', 5000);
+          } else if(event === 'error_msg'){
+            showErr(esc(data.message || 'Error de búsqueda'));
+          } else if(event === 'done'){
+            sawDone = true;
+            S.allResults = [...merged.values()].sort((a,b) => String(getRowDate(b)).localeCompare(String(getRowDate(a))));
+            S.currentTotal = S.allResults.length;
+            S.currentPages = Math.max(1, Math.ceil(S.currentTotal / PAGE_SIZE));
+            if(data.warnings?.length){
+              const msg = data.warnings.join(' ');
+              if(merged.size) toast(msg, 'warning', 6000);
+              else showErr(esc(msg));
+            }
+            goToPage(1);
+          }
+        });
+        failed = !sawDone && merged.size === 0;
+        if(failed && attempt < 2) continue;
+        break;
+      }catch(err){
+        if(err?.name === 'AbortError' || myToken !== searchToken) return;
+        if(attempt < 2 && merged.size === 0) continue;
+        failed = merged.size === 0;
+        if(merged.size > 0){
+          S.allResults = [...merged.values()].sort((a,b) => String(getRowDate(b)).localeCompare(String(getRowDate(a))));
+          S.currentTotal = S.allResults.length;
+          S.currentPages = Math.max(1, Math.ceil(S.currentTotal / PAGE_SIZE));
+          goToPage(1);
+        }
       }
-      evtSource.close();
-      if(S.activeSearchSource === evtSource) S.activeSearchSource = null;
-    };
+    }
+    if(failed && myToken === searchToken && S.activeRadarId === searchRadarId){
+      $('countText').textContent = '0';
+      showErr('Error de conexión con el servidor de búsqueda.');
+    }
+    if(S.activeSearchSource === stream) S.activeSearchSource = null;
 
   }catch(e){
     console.error('Error search:', e);

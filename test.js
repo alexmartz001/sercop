@@ -512,6 +512,34 @@ describe('Server API', () => {
     assert.equal(deleted.status, 200);
   });
 
+  it('todas las fuentes muestra los procesos SERCOP de Hacking Etico y LOPDP', {timeout: 170000}, async () => {
+    const id = 'r_todas_live';
+    const created = await api('/api/radares', {method:'POST', body:{
+      id, nombre:'Seguridad', year:2026, source:'todas', buyer:'', supplier:'',
+      search:'Hacking Etico, LOPDP'
+    }});
+    assert.equal(created.status, 201);
+    const r = await apiStream(`/api/search?radarId=${encodeURIComponent(id)}`);
+    assert.equal(r.status, 200);
+    const events = parseSSE(r.body);
+    const done = events.find(e => e.event === 'done');
+    assert.ok(done, 'la búsqueda debe emitir done');
+    assert.ok(done.data.total >= 2, `se esperaban al menos 2 procesos, llegaron ${done.data.total}`);
+    const rows = events.filter(e => e.event === 'result').map(e => e.data);
+    const blob = rows.map(row => [row?.buyerName, row?.title, row?.description, row?.ocid].filter(Boolean).join(' ')).join('\n');
+    assert.match(blob, /Yachay|LOPDP/i);
+    assert.match(blob, /EL[EÉ]CTRICA QUITO|AGUAPEN|HACKING/i);
+    const firstResult = r.body.indexOf('event: result');
+    const firstSlow = r.body.search(/event: warning|NCO error|UNDP error/);
+    assert.ok(firstResult > 0, 'debe haber eventos result');
+    if(firstSlow > 0) assert.ok(firstResult < firstSlow, 'SERCOP tiene que llegar antes de las fuentes lentas');
+    const saved = await api(`/api/radares/${encodeURIComponent(id)}/results`);
+    assert.equal(saved.status, 200);
+    assert.ok(saved.json().length >= 2, 'los procesos deben quedar guardados en el radar');
+    const deleted = await api(`/api/radares/${id}`, {method:'DELETE'});
+    assert.equal(deleted.status, 200);
+  });
+
 });
 
 describe('Auth (NVG_TOKEN)', () => {
