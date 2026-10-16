@@ -662,7 +662,7 @@ async function fetchWithRetryUnlocked(url, fetchOpts, okStatuses, retries){
       continue;
     }
     if(okStatuses.includes(resp.status)) return resp;
-    if(!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    if(!resp.ok) throw new Error(await sercopHttpDetail(resp));
     const remainHeader = resp.headers.get('x-ratelimit-remaining');
     if(remainHeader != null && remainHeader !== '' && Number(remainHeader) === 0){
       const wait = retryAfterMs(resp, 0);
@@ -672,6 +672,20 @@ async function fetchWithRetryUnlocked(url, fetchOpts, okStatuses, retries){
   }
   if(lastErr) throw lastErr;
   throw new Error('HTTP 429');
+}
+
+async function sercopHttpDetail(resp){
+  let detail = '';
+  try{
+    const parsed = JSON.parse(await resp.text());
+    const fieldErrors = parsed?.errors && typeof parsed.errors === 'object'
+      ? Object.values(parsed.errors).flat().map(v => String(v || '').trim()).filter(Boolean).slice(0, 3).join('; ')
+      : '';
+    detail = fieldErrors || (typeof parsed?.message === 'string' ? parsed.message : '');
+  }catch(_){}
+  detail = String(detail || '').replace(/\s+/g, ' ').trim().slice(0, 180);
+  if(/too many attempts/i.test(detail)) detail = 'demasiadas consultas al portal';
+  return detail ? `HTTP ${resp.status}: ${detail}` : `HTTP ${resp.status}`;
 }
 
 function getCached(url){
@@ -709,6 +723,35 @@ const wantsSource = (radar, source) => {
 };
 const SEARCH_STOP_WORDS = new Set(['con','del','desde','el','en','la','las','los','para','por','una','uno','y']);
 const splitRadarTerms = value => String(value || '').split(',').map(t => t.trim()).filter(t => t.length >= 2);
+// Contrato de search_ocds: year 2015..año actual; search, buyer y supplier
+// con al menos 3 caracteres. https://datosabiertos.compraspublicas.gob.ec/PLATAFORMA/datos-abiertos/api
+const SERCOP_YEAR_MIN = 2015;
+const sercopCurrentYear = () => new Date().getFullYear();
+const sercopKeyword = value => {
+  const s = String(value ?? '').trim();
+  return s.length >= 3 ? s : '';
+};
+function sercopYear(year){
+  const y = Number(year);
+  if(!Number.isInteger(y) || y < SERCOP_YEAR_MIN || y > sercopCurrentYear()) return null;
+  return y;
+}
+function sercopQuery(term, year, buyer, supplier){
+  const search = sercopKeyword(term);
+  const y = sercopYear(year);
+  const buyerText = String(buyer ?? '').trim();
+  const supplierText = String(supplier ?? '').trim();
+  return {
+    search,
+    year: y,
+    buyer: buyerText ? sercopKeyword(buyerText) : '',
+    supplier: supplierText ? sercopKeyword(supplierText) : '',
+    shortSearch: !search,
+    badYear: !!search && !y,
+    shortBuyer: !!buyerText && buyerText.length < 3,
+    shortSupplier: !!supplierText && supplierText.length < 3
+  };
+}
 const escapeRe = s => String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
 function termTokens(term){
@@ -738,12 +781,27 @@ function rowSearchText(row){
   ]);
   return [
     row?.title, row?.description,
-    row?.buyerName, row?.buyer_name, row?.entidad,
-    row?.buyer?.name, row?.buyer?.identifier?.legalName,
+    partyName(row?.buyerName), partyName(row?.buyer_name), partyName(row?.buyer), partyName(row?.entidad),
+    row?.single_provider, partyName(row?.suppliers),
     row?.internal_type, row?.method, row?.modalidad,
     row?.procurementMethodDetails, row?.tender?.procurementMethod,
     ...itemFields
   ].filter(Boolean).join(' | ');
+}
+
+function partyName(value){
+  if(value == null || value === '') return '';
+  if(typeof value === 'string') return value.trim();
+  if(Array.isArray(value)) return value.map(partyName).filter(Boolean).join(', ');
+  if(typeof value === 'object') return String(firstNonEmpty(value.name, value.legalName, value.identifier?.legalName, value.identifier?.id) ?? '').trim();
+  return '';
+}
+
+function partyList(value){
+  if(value == null || value === '') return [];
+  if(Array.isArray(value)) return value.flatMap(partyList);
+  const name = partyName(value);
+  return name ? [name] : [];
 }
 
 function termMatchesRow(row, term){
@@ -764,13 +822,17 @@ function rowMatchesRadar(row, radar){
 }
 
 async function fetchSERCOPAllPages(term, year, buyer, supplier, onProgress, force){
+  const query = sercopQuery(term, year, buyer, supplier);
+  if(query.shortSearch || query.badYear){
+    return {out:[], truncated:false, totalAvailable:0, skipped: query.shortSearch ? 'search' : 'year', query};
+  }
   let page = 1, pages = 1;
   const out = [];
   let lastData = null;
   do{
-    const params = new URLSearchParams({year, search:term, page});
-    if(buyer) params.set('buyer', buyer);
-    if(supplier) params.set('supplier', supplier);
+    const params = new URLSearchParams({year: query.year, search: query.search, page});
+    if(query.buyer) params.set('buyer', query.buyer);
+    if(query.supplier) params.set('supplier', query.supplier);
     lastData = await fetchCached(`${SERCOP_API}/search_ocds?${params.toString()}`, undefined, force);
     const rows = Array.isArray(lastData?.data) ? lastData.data : (Array.isArray(lastData) ? lastData : []);
     out.push(...rows);
@@ -787,26 +849,31 @@ async function fetchSERCOPAllPages(term, year, buyer, supplier, onProgress, forc
     seen.add(k);
     return true;
   });
-  return {out: deduped, truncated: pages > MAX_PAGES, totalAvailable: deduped.length};
+  return {out: deduped, truncated: pages > MAX_PAGES, totalAvailable: deduped.length, skipped:null, query};
 }
 
 async function fetchSERCOPByCPC(cpcCode, year, buyer, onProgress, force){
+  const query = sercopQuery(cpcCode, year, buyer, '');
+  if(query.shortSearch || query.badYear){
+    return {out:[], truncated:false, totalAvailable:0, skipped: query.shortSearch ? 'search' : 'year', query};
+  }
   let page = 1, pages = 1;
   const out = [];
   let lastData = null;
   do{
-    const params = new URLSearchParams({year, search:cpcCode, page});
-    if(buyer) params.set('buyer', buyer);
+    const params = new URLSearchParams({year: query.year, search: query.search, page});
+    if(query.buyer) params.set('buyer', query.buyer);
     lastData = await fetchCached(`${SERCOP_API}/search_ocds?${params.toString()}`, undefined, force);
     const rows = Array.isArray(lastData?.data) ? lastData.data : (Array.isArray(lastData) ? lastData : []);
-    const filtered = rows.filter(row => {
+    const exposesClass = rows.some(row => Array.isArray(row?.items) && row.items.length);
+    const filtered = exposesClass ? rows.filter(row => {
       const items = Array.isArray(row?.items) ? row.items : [];
       return items.some(it => {
         const classId = it?.classification?.id || '';
         const addClass = Array.isArray(it?.additionalClassifications) ? it.additionalClassifications.map(c => c.id) : [];
         return classId === cpcCode || addClass.includes(cpcCode);
       });
-    });
+    }) : rows;
     out.push(...filtered);
     pages = Number(lastData?.pages || lastData?.total_pages || 1) || 1;
     if(onProgress) onProgress({type:'page', term:`CPC ${cpcCode}`, page, pages, count:out.length});
@@ -821,7 +888,13 @@ async function fetchSERCOPByCPC(cpcCode, year, buyer, onProgress, force){
     seen.add(k);
     return true;
   });
-  return {out: deduped, truncated: pages > MAX_PAGES, totalAvailable: pages > MAX_PAGES ? (realTotal || pages * PAGE_SIZE) : deduped.length};
+  return {out: deduped, truncated: pages > MAX_PAGES, totalAvailable: pages > MAX_PAGES ? (realTotal || pages * PAGE_SIZE) : deduped.length, skipped:null, query};
+}
+
+function sercopSkipMessage(label, skipped){
+  if(skipped === 'search') return `"${label}": SERCOP exige al menos 3 caracteres`;
+  if(skipped === 'year') return `SERCOP solo admite años entre ${SERCOP_YEAR_MIN} y ${sercopCurrentYear()}`;
+  return '';
 }
 
 async function fetchBIDProjects(term, year){
@@ -1518,7 +1591,8 @@ async function runMonitor(){
       }
       if(wantsSource(radar, 'sercop')){
         try {
-          const {out} = await fetchSERCOPAllPages(term, radar.year, radar.buyer, radar.supplier, null, true);
+          const {out, skipped} = await fetchSERCOPAllPages(term, radar.year, radar.buyer, radar.supplier, null, true);
+          if(skipped) console.warn(`  [Monitor] ${sercopSkipMessage(term, skipped)}`);
           for(const raw of out){
             const row = normalizeSearchRow(raw, term);
             if(row && !allResults.has(row.ocid)) allResults.set(row.ocid, row);
@@ -1536,7 +1610,8 @@ async function runMonitor(){
     for(const cpc of cpcCodes){
       if(!wantsSource(radar, 'sercop')) continue;
       try {
-        const {out} = await fetchSERCOPByCPC(cpc, radar.year, radar.buyer, null, true);
+        const {out, skipped} = await fetchSERCOPByCPC(cpc, radar.year, radar.buyer, null, true);
+        if(skipped) console.warn(`  [Monitor] ${sercopSkipMessage('CPC '+cpc, skipped)}`);
         for(const raw of out){
           const row = normalizeSearchRow(raw, `CPC ${cpc}`);
           if(row && !allResults.has(row.ocid)) allResults.set(row.ocid, row);
@@ -1622,7 +1697,7 @@ function mergeDetail(payload){
   const rawValue = values[0] || null;
   const value = typeof rawValue==='number'?{amount:rawValue,currency:'USD'}:rawValue;
   const cpcs = [...new Set(allItems.flatMap(it=>[it?.classification?.id, ...(Array.isArray(it?.additionalClassifications)?it.additionalClassifications.map(c=>c.id):[])]).filter(Boolean).map(String))];
-  const supplierNames = [...new Set(awards.flatMap(a=>(a.suppliers||[]).map(s=>firstNonEmpty(s.name,s.identifier?.legalName,s.identifier?.id))).filter(Boolean))];
+  const supplierNames = [...new Set(awards.flatMap(a => partyList(a?.suppliers)))];
   const releaseDates = releases.flatMap(r=>[r.datePublished,r.publishedDate,r.releaseDate,r.date]);
   const tenderPublishDates = tenders.flatMap(t=>[t.datePublished,t.tenderPeriod?.startDate]);
   const publicationDate = earliestDate([...releaseDates,...tenderPublishDates]);
@@ -1653,7 +1728,12 @@ function getRowTitle(row){ return fixEncoding(String(firstNonEmpty(row?.title, r
 function getRowDescription(row){ return fixEncoding(String(firstNonEmpty(row?.description, row?.tender?.description) ?? '')); }
 function getRowDate(row){ return String(firstNonEmpty(row?.datePublished, row?.publishedDate, row?.releaseDate, row?.date, row?.tender?.datePublished, row?.tender?.tenderPeriod?.startDate) ?? ''); }
 function getRowModality(row){ return String(firstNonEmpty(row?.internal_type, row?.procurementMethodDetails, row?.tender?.procurementMethodDetails, row?.tender?.procurementMethod, row?.method) ?? '—'); }
-function getBuyerLabel(row){ return fixEncoding(String(firstNonEmpty(row?.buyerName, row?.buyer_name, row?.buyer?.name, row?.entidad, row?.buyer?.identifier?.legalName, row?.buyer?.identifier?.id, row?.buyerId) ?? '—')); }
+function getBuyerLabel(row){
+  return fixEncoding(String(firstNonEmpty(
+    partyName(row?.buyerName), partyName(row?.buyer_name), partyName(row?.buyer),
+    partyName(row?.entidad), row?.buyer?.identifier?.legalName, row?.buyer?.identifier?.id, row?.buyerId
+  ) ?? '—'));
+}
 
 const OCDS_MODALITY_RE = /^(SIE|CPC|LICO|CE|CO|ICQ|SNCP|SGP|ICAP|CGUV|AP)-/;
 function procCodeTail(ocid){
@@ -1674,6 +1754,10 @@ function normalizeSearchRow(row, term){
   }
   row.ocid = ocid;
   row.source = row.source || 'SERCOP';
+  if(!row.buyerName){
+    const buyer = partyName(row.buyer);
+    if(buyer) row.buyerName = buyer;
+  }
   const title = String(row.title ?? '').trim();
   const desc = String(row.description ?? '').trim();
   const tail = procCodeTail(ocid);
@@ -1913,9 +1997,7 @@ function getMercado(year, cpc, entidad){
       d = {
         publicationDate: String(firstNonEmpty(raw.publicationDate, raw.date, raw.year) ?? ''),
         cpcs: Array.isArray(raw.cpcs) ? raw.cpcs : [],
-        supplierNames: Array.isArray(raw.suppliers)
-          ? raw.suppliers.map(s => String(firstNonEmpty(s?.name, s?.identifier?.legalName, s?.identifier?.id) ?? '')).filter(Boolean)
-          : [],
+        supplierNames: [...new Set([...partyList(raw.suppliers), ...partyList(raw.single_provider)])],
         value: amount > 0 ? {amount, currency:'USD'} : null,
         modalidad: String(firstNonEmpty(raw.modalidad, raw.internal_type) ?? '')
       };
@@ -2089,6 +2171,16 @@ async function handleSearch(req, res, params){
   const merged = new Map();
   const sourceErrors = [];
   const seenTails = new Map();
+  let sercopPartyWarned = false;
+  function warnSercopParties(query){
+    if(sercopPartyWarned || !query) return;
+    const bits = [];
+    if(query.shortBuyer) bits.push('comprador');
+    if(query.shortSupplier) bits.push('proveedor');
+    if(!bits.length) return;
+    sercopPartyWarned = true;
+    send('warning', {message:`${bits.join(' y ')} omitido: SERCOP exige al menos 3 caracteres`});
+  }
 
   function mergeSERCOPRow(row, radarId, send){
     const tail = procCodeTail(row.ocid);
@@ -2152,7 +2244,9 @@ async function handleSearch(req, res, params){
 
       if(wantsSource(radar, 'sercop')){
         try {
-          const {out, truncated, totalAvailable} = await fetchSERCOPAllPages(term, radar.year, radar.buyer, radar.supplier, (prog) => send('progress', prog), true);
+          const {out, truncated, totalAvailable, skipped, query} = await fetchSERCOPAllPages(term, radar.year, radar.buyer, radar.supplier, (prog) => send('progress', prog), true);
+          if(skipped) send('warning', {message: sercopSkipMessage(term, skipped)});
+          else warnSercopParties(query);
           if(truncated) send('warning', {message:`"${term}": mostrando primeras ${MAX_PAGES} paginas de resultados`, totalAvailable});
           for(const raw of out){
             const row = normalizeSearchRow(raw, term);
@@ -2191,7 +2285,9 @@ async function handleSearch(req, res, params){
 
       if(wantsSource(radar, 'sercop')){
         try {
-          const {out, truncated, totalAvailable} = await fetchSERCOPByCPC(cpc, radar.year, radar.buyer, (prog) => send('progress', prog), true);
+          const {out, truncated, totalAvailable, skipped, query} = await fetchSERCOPByCPC(cpc, radar.year, radar.buyer, (prog) => send('progress', prog), true);
+          if(skipped) send('warning', {message: sercopSkipMessage(`CPC ${cpc}`, skipped)});
+          else warnSercopParties(query);
           if(truncated) send('warning', {message:`"CPC ${cpc}": mostrando primeras ${MAX_PAGES} paginas de resultados`, totalAvailable});
           for(const raw of out){
             const row = normalizeSearchRow(raw, `CPC ${cpc}`);
@@ -2767,7 +2863,9 @@ const server = http.createServer(async (req, res) => {
       const q = (params.q || '').trim();
       const year = params.year || String(new Date().getFullYear());
       const term = (params.term || '').trim();
-      if(!q) return json(res, 400, {error:'q (entidad) required'});
+      if(q.length < 3) return json(res, 400, {error:'la entidad debe tener al menos 3 caracteres'});
+      if(!sercopKeyword(term)) return json(res, 400, {error:'SERCOP exige una palabra clave de al menos 3 caracteres'});
+      if(!sercopYear(year)) return json(res, 400, {error:`SERCOP solo admite años entre ${SERCOP_YEAR_MIN} y ${sercopCurrentYear()}`});
       let {out, totalAvailable} = {out:[], totalAvailable:0};
       try{
         const r = await fetchSERCOPAllPages(term, year, q, undefined, undefined, true);

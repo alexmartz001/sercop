@@ -243,6 +243,10 @@ describe('Server API', () => {
     assert.equal(empty.status, 400);
     const missing = await api('/api/entity-live?year=2026');
     assert.equal(missing.status, 400);
+    const shortTerm = await api('/api/entity-live?q=Municipio&year=2026&term=ab');
+    assert.equal(shortTerm.status, 400);
+    const shortBuyer = await api('/api/entity-live?q=EP&year=2026&term=agua');
+    assert.equal(shortBuyer.status, 400);
   });
 
   it('GET /api/nco validates query input', async () => {
@@ -466,6 +470,26 @@ describe('Server API', () => {
     assert.equal(list.status, 200);
   });
 
+  it('SERCOP no consulta palabras o años fuera del contrato', async () => {
+    const id = 'r_sercop_contract';
+    const created = await api('/api/radares', {method:'POST', body:{
+      id, nombre:'Contrato', year:2099, source:'sercop', buyer:'EP', supplier:'AB', search:'ab,agua'
+    }});
+    assert.equal(created.status, 201);
+    const r = await apiStream(`/api/search?radarId=${encodeURIComponent(id)}`, 15000);
+    assert.equal(r.status, 200);
+    const events = parseSSE(r.body);
+    const done = events.find(e => e.event === 'done');
+    assert.ok(done, 'la búsqueda debe cerrar sin llamar al portal');
+    const warnings = events.filter(e => e.event === 'warning').map(e => e.data?.message || '').join(' ');
+    assert.match(warnings, /al menos 3 caracteres/);
+    assert.match(warnings, /solo admite años/);
+    assert.equal(done.data.total, 0);
+    assert.equal((events.filter(e => e.event === 'result')).length, 0);
+    const deleted = await api(`/api/radares/${id}`, {method:'DELETE'});
+    assert.equal(deleted.status, 200);
+  });
+
   it('búsqueda SERCOP sigue cuando una IP del portal no responde', {timeout: 90000}, async () => {
     const id = 'r_sercop_live';
     const created = await api('/api/radares', {method:'POST', body:{
@@ -482,6 +506,8 @@ describe('Server API', () => {
     assert.equal(warnings.includes('fetch failed'), false, warnings);
     assert.equal(/conexión fallida|HTTP 429/.test(warnings), false, warnings);
     assert.ok(done.data.total > 0, 'SERCOP debe devolver procesos para esas palabras');
+    const rows = events.filter(e => e.event === 'result').map(e => e.data);
+    assert.ok(rows.some(row => row && row.buyerName && row.buyerName !== '—'), 'search_ocds trae la entidad en buyer o buyerName');
     const deleted = await api(`/api/radares/${id}`, {method:'DELETE'});
     assert.equal(deleted.status, 200);
   });
