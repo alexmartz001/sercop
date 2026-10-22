@@ -9,7 +9,10 @@
     "test": "node --test --test-timeout=180000 test.js"
   },
   "engines": {
-    "node": ">=22"
+    "node": ">=24.22.1"
+  },
+  "allowScripts": {
+    "better-sqlite3@11.10.0": true
   },
   "dependencies": {
     "better-sqlite3": "^11.10.0",

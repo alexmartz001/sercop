@@ -13,7 +13,7 @@ La auditoría de seguridad está en [`AUDITORIA.md`](./AUDITORIA.md).
 
 ## 1. Requisitos
 
-- **Node.js ≥ 18** (probado en v24). El envío por Graph usa `fetch` nativo.
+- **Node.js 24.22.1** o posterior (LTS con los parches del 21 de octubre de 2026). La imagen de despliegue fija `node:24.22.1-bookworm-slim`. El envío por Graph usa `fetch` nativo.
 - Un **volumen persistente** para la base de datos SQLite (`NVG_DB`).
 
 ## 2. Arranque rápido
