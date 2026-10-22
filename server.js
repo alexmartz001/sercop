@@ -6,6 +6,7 @@ const Database = require('better-sqlite3');
 const fs = require('node:fs');
 const path = require('node:path');
 const auth = require('./auth');
+const ocds = require('./ocds');
 const { createIntegrations } = require('./integrations');
 
 function resolveListenPort(){
@@ -206,6 +207,44 @@ function initDB(){
     ocid TEXT, field TEXT, old_value TEXT, new_value TEXT,
     user TEXT DEFAULT '', created_at TEXT DEFAULT (datetime('now')))`);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_pipe_hist_ocid ON pipeline_history(ocid)`);
+  for(const alter of [
+    'ALTER TABLE procesos ADD COLUMN entidad_ruc TEXT',
+    'ALTER TABLE procesos ADD COLUMN presupuesto REAL',
+    'ALTER TABLE procesos ADD COLUMN estado_actual TEXT',
+    'ALTER TABLE procesos ADD COLUMN url_portal TEXT',
+    'ALTER TABLE procesos ADD COLUMN synced_at TEXT',
+    'ALTER TABLE procesos ADD COLUMN codigo_proceso TEXT',
+    'ALTER TABLE procesos ADD COLUMN awards_count INTEGER',
+    'ALTER TABLE procesos ADD COLUMN contracts_count INTEGER',
+    'ALTER TABLE procesos ADD COLUMN tenders_count INTEGER'
+  ]){
+    try { db.exec(alter); } catch(e){}
+  }
+  db.exec(`CREATE TABLE IF NOT EXISTS cronograma_etapas(
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ocid TEXT NOT NULL,
+    etapa_nombre TEXT NOT NULL,
+    fecha_limite TEXT NOT NULL,
+    completada INTEGER DEFAULT 0,
+    UNIQUE(ocid, etapa_nombre))`);
+  db.exec(`CREATE TABLE IF NOT EXISTS participantes_proceso(
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ocid TEXT NOT NULL,
+    proveedor_ruc TEXT,
+    proveedor_nombre TEXT,
+    estado_oferta TEXT,
+    monto_oferta REAL,
+    UNIQUE(ocid, proveedor_ruc, proveedor_nombre, estado_oferta))`);
+  db.exec(`CREATE TABLE IF NOT EXISTS proceso_cambios(
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ocid TEXT NOT NULL,
+    campo TEXT NOT NULL,
+    valor_anterior TEXT,
+    valor_nuevo TEXT,
+    created_at TEXT DEFAULT (datetime('now')))`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_cronograma_ocid ON cronograma_etapas(ocid)`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_participantes_ocid ON participantes_proceso(ocid)`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_cambios_ocid ON proceso_cambios(ocid)`);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_pipe_owner ON pipeline(owner_id)`);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_pipe_status ON pipeline(status)`);
   db.exec(`CREATE TABLE IF NOT EXISTS entidades(
@@ -459,17 +498,58 @@ function dbRun(sql, params=[]){
 }
 
 // -- SERCOP API Client ----------------------------------------------
-// datosabiertos.compraspublicas.gob.ec publica más de una IP. Una de ellas
-// deja la conexión colgada y el fetch nativo aborta con "fetch failed" sin
-// probar la otra. Aquí se recorren todas las direcciones, se recuerda la que
-// respondió y las peticiones salen de una en una para no disparar el cupo
-// (60/min, cabecera Retry-After).
+// datosabiertos.compraspublicas.gob.ec publica más de una IP. Se consultan en
+// paralelo: la primera respuesta útil gana y el resto se aborta. Una IP que
+// agota el tiempo queda fuera unos minutos. Si todas fallan, se reintenta con
+// TLS 1.2 y después con fetch global. Un fallo total abre una pausa corta para
+// no repetir el mismo bloqueo en cada término del radar.
 const CONNECT_TIMEOUT_MS = Math.max(2000, Number(process.env.NVG_CONNECT_TIMEOUT_MS) || 8000);
 const RESPONSE_TIMEOUT_MS = Math.max(5000, Number(process.env.NVG_RESPONSE_TIMEOUT_MS) || 30000);
 const HEALTHY_TTL_MS = 10 * 60 * 1000;
+const DEAD_ADDRESS_TTL_MS = 10 * 60 * 1000;
+const SERCOP_DOWN_MS = 90 * 1000;
 const MAX_RESPONSE_BYTES = 25 * 1024 * 1024;
+const SERCOP_HOST = 'datosabiertos.compraspublicas.gob.ec';
 const healthyAddress = new Map();
+const deadAddress = new Map();
+let sercopDownUntil = 0;
 let fetchChain = Promise.resolve();
+
+function proxyUrl(){
+  return String(process.env.HTTPS_PROXY || process.env.https_proxy || process.env.HTTP_PROXY || process.env.http_proxy || '').trim();
+}
+if(proxyUrl()) process.env.NODE_USE_ENV_PROXY = '1';
+
+function isSercopHost(hostname){ return hostname === SERCOP_HOST; }
+function isSercopApi(url){
+  try { return isSercopHost(new URL(url).hostname); }
+  catch { return false; }
+}
+function sercopPaused(){ return Date.now() < sercopDownUntil; }
+function noteSercopDown(){
+  sercopDownUntil = Date.now() + SERCOP_DOWN_MS;
+  console.warn('  SERCOP en pausa 90s tras fallo de conexión');
+}
+function noteSercopOk(){ sercopDownUntil = 0; }
+function addressKey(hostname, address){ return `${hostname}|${address}`; }
+function addressDead(hostname, address){
+  const until = deadAddress.get(addressKey(hostname, address));
+  return !!until && until > Date.now();
+}
+function markAddressDead(hostname, address){
+  if(!hostname || !address || address === 'fetch') return;
+  deadAddress.set(addressKey(hostname, address), Date.now() + DEAD_ADDRESS_TTL_MS);
+}
+function liveTargets(hostname, targets){
+  const live = targets.filter(target => !addressDead(hostname, target.address));
+  return live.length ? live : targets;
+}
+function isConnectFailure(error){
+  const code = String(error?.code || '');
+  if(['ETIMEDOUT','ECONNRESET','ECONNREFUSED','EHOSTUNREACH','ENETUNREACH','EAI_AGAIN','ENOTFOUND','ECONN','UND_ERR_CONNECT_TIMEOUT','ECONNABORTED'].includes(code)) return true;
+  if(code === 'ABORT' || code === 'SERCOP_PAUSE') return false;
+  return /ETIMEDOUT|tiempo de conexión|conexión fallida|socket hang up|fetch failed|operation was aborted/i.test(String(error?.message || ''));
+}
 
 function enqueueExternalFetch(task){
   const run = fetchChain.then(async () => {
@@ -541,6 +621,9 @@ function requestOnce(urlObj, opts, target){
     if(body && !Object.keys(headers).some(k => k.toLowerCase() === 'content-length')){
       headers['Content-Length'] = String(body.length);
     }
+    const tlsOpts = urlObj.protocol === 'https:' && opts.minVersion
+      ? {minVersion: opts.minVersion, maxVersion: opts.maxVersion || opts.minVersion}
+      : {};
     req = lib.request({
       protocol: urlObj.protocol,
       hostname: urlObj.hostname,
@@ -552,7 +635,8 @@ function requestOnce(urlObj, opts, target){
       lookup: lookupPinned(target.address, target.family),
       timeout: Math.max(2000, Number(opts.connectTimeout) || CONNECT_TIMEOUT_MS),
       autoSelectFamily: false,
-      agent: false
+      agent: false,
+      ...tlsOpts
     }, (res) => {
       req.setTimeout(RESPONSE_TIMEOUT_MS);
       const chunks = [];
@@ -607,25 +691,85 @@ function requestOnce(urlObj, opts, target){
   };
 }
 
-async function requestFirstReachable(urlObj, opts, targets){
-  let lastErr = null;
-  for(const target of targets){
-    const handle = requestOnce(urlObj, opts, target);
-    try{
-      const resp = await handle.promise;
+function requestRace(urlObj, opts, targets){
+  if(!targets.length) return Promise.reject(Object.assign(new Error(`sin direcciones para ${urlObj.hostname}`), {code:'ENOTFOUND'}));
+  if(targets.length === 1){
+    const only = targets[0];
+    const handle = requestOnce(urlObj, opts, only);
+    return handle.promise.then(resp => {
       if(resp.status >= 500 || resp.status === 408){
-        lastErr = new Error(`HTTP ${resp.status}`);
-        console.warn(`  ${urlObj.hostname} vía ${target.address}: HTTP ${resp.status}`);
-        continue;
+        throw Object.assign(new Error(`HTTP ${resp.status}`), {code:`HTTP_${resp.status}`, address: only.address});
       }
       return resp;
-    }catch(e){
-      lastErr = e;
-      if(e.code !== 'ABORT') console.warn(`  ${urlObj.hostname} vía ${target.address}: ${e.code || e.message}`);
-    }
+    }).catch(error => {
+      if(isConnectFailure(error)) markAddressDead(urlObj.hostname, only.address);
+      if(error.code !== 'ABORT') console.warn(`  ${urlObj.hostname} vía ${only.address}: ${error.code || error.message}`);
+      throw error;
+    });
   }
-  const detail = lastErr ? (lastErr.code || lastErr.message) : 'sin respuesta';
-  throw Object.assign(new Error(`conexión fallida con ${urlObj.hostname} (${detail})`), {code: lastErr?.code || 'ECONN'});
+  return new Promise((resolve, reject) => {
+    let pending = targets.length;
+    let settled = false;
+    let lastErr = null;
+    const handles = [];
+    const finishFail = () => {
+      if(settled) return;
+      settled = true;
+      const detail = lastErr ? (lastErr.code || lastErr.message) : 'sin respuesta';
+      reject(Object.assign(new Error(`conexión fallida con ${urlObj.hostname} (${detail})`), {code: lastErr?.code || 'ECONN', cause: lastErr}));
+    };
+    for(const target of targets){
+      const handle = requestOnce(urlObj, opts, target);
+      handles.push(handle);
+      handle.promise.then(resp => {
+        if(settled) return;
+        if(resp.status >= 500 || resp.status === 408){
+          lastErr = Object.assign(new Error(`HTTP ${resp.status}`), {code:`HTTP_${resp.status}`, address: target.address});
+          console.warn(`  ${urlObj.hostname} vía ${target.address}: HTTP ${resp.status}`);
+          pending--;
+          if(pending === 0) finishFail();
+          return;
+        }
+        settled = true;
+        for(const other of handles) if(other !== handle) other.abort();
+        resolve(resp);
+      }).catch(error => {
+        if(settled || error.code === 'ABORT') return;
+        lastErr = error;
+        if(isConnectFailure(error)) markAddressDead(urlObj.hostname, target.address);
+        console.warn(`  ${urlObj.hostname} vía ${target.address}: ${error.code || error.message}`);
+        pending--;
+        if(pending === 0) finishFail();
+      });
+    }
+  });
+}
+
+async function globalFetchFallback(url, opts){
+  const ms = Math.max(10000, Math.min(15000, Number(opts.connectTimeout) || 12000));
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), ms);
+  try{
+    const resp = await fetch(url, {
+      method: opts.method || 'GET',
+      headers: {'Accept':'application/json', 'User-Agent':'NVG-Radar/11', ...(opts.headers || {})},
+      body: opts.body,
+      signal: ctrl.signal,
+      redirect: 'follow'
+    });
+    const buf = Buffer.from(await resp.arrayBuffer());
+    if(buf.length > MAX_RESPONSE_BYTES) throw Object.assign(new Error('respuesta demasiado grande'), {code:'ERR_BODY_TOO_LARGE'});
+    return {
+      status: resp.status,
+      ok: resp.ok,
+      headers: {get: (name) => resp.headers.get(name)},
+      text: async () => buf.toString('utf8'),
+      json: async () => JSON.parse(buf.toString('utf8')),
+      address: 'fetch'
+    };
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 function retryAfterMs(resp, attempt){
@@ -644,25 +788,56 @@ function retryAfterMs(resp, attempt){
 
 async function fetchOnceWithFailover(url, opts, redirects = 0){
   const urlObj = new URL(url);
+  if(isSercopHost(urlObj.hostname) && sercopPaused()){
+    throw Object.assign(new Error('portal en pausa'), {code:'SERCOP_PAUSE'});
+  }
+  if(proxyUrl()){
+    const proxied = await globalFetchFallback(url, opts);
+    if(isSercopHost(urlObj.hostname) && (proxied.ok || proxied.status === 429)) noteSercopOk();
+    return proxied;
+  }
   const all = await resolveHostAddresses(urlObj.hostname);
   const healthy = healthyAddress.get(urlObj.hostname);
-  const pinned = healthy && healthy.until > Date.now() ? all.filter(a => a.address === healthy.address) : [];
-  const targets = pinned.length ? [...pinned, ...all.filter(a => a.address !== pinned[0].address)] : all;
+  const ordered = [...all];
+  if(healthy && healthy.until > Date.now()){
+    const idx = ordered.findIndex(item => item.address === healthy.address);
+    if(idx > 0){
+      const [hit] = ordered.splice(idx, 1);
+      ordered.unshift(hit);
+    }
+  }
   let resp;
   try{
-    resp = await requestFirstReachable(urlObj, opts, targets);
-  }catch(e){
-    if(pinned.length) healthyAddress.delete(urlObj.hostname);
-    throw e;
+    resp = await requestRace(urlObj, opts, liveTargets(urlObj.hostname, ordered));
+  }catch(error){
+    if(isConnectFailure(error) && !opts._tls12){
+      try{
+        resp = await requestRace(urlObj, {...opts, minVersion:'TLSv1.2', maxVersion:'TLSv1.2', _tls12:true}, ordered);
+      }catch(tlsError){
+        try{
+          resp = await globalFetchFallback(url, opts);
+        }catch(fetchError){
+          healthyAddress.delete(urlObj.hostname);
+          if(isSercopHost(urlObj.hostname)) noteSercopDown();
+          throw fetchError;
+        }
+      }
+    } else {
+      healthyAddress.delete(urlObj.hostname);
+      if(isSercopHost(urlObj.hostname) && isConnectFailure(error)) noteSercopDown();
+      throw error;
+    }
   }
   const method = String(opts.method || 'GET').toUpperCase();
   if(redirects < 4 && [301, 302, 303, 307, 308].includes(resp.status) && (method === 'GET' || method === 'HEAD')){
     const loc = resp.headers.get('location');
     if(loc) return fetchOnceWithFailover(new URL(loc, url).toString(), opts, redirects + 1);
   }
-  if(resp.address && (resp.ok || resp.status === 429 || (resp.status >= 400 && resp.status < 500))){
+  if(resp.address && resp.address !== 'fetch' && (resp.ok || resp.status === 429 || (resp.status >= 400 && resp.status < 500))){
     healthyAddress.set(urlObj.hostname, {address: resp.address, until: Date.now() + HEALTHY_TTL_MS});
+    deadAddress.delete(addressKey(urlObj.hostname, resp.address));
   }
+  if(isSercopHost(urlObj.hostname) && (resp.ok || resp.status === 429)) noteSercopOk();
   return resp;
 }
 
@@ -683,7 +858,7 @@ async function fetchWithRetryUnlocked(url, fetchOpts, okStatuses, retries){
       resp = await fetchOnceWithFailover(url, fetchOpts);
     }catch(e){
       lastErr = e;
-      if(attempt >= retries) break;
+      if(e.code === 'SERCOP_PAUSE' || attempt >= retries) break;
       const wait = Math.min(1000 * Math.pow(2, attempt), 8000);
       console.warn(`  reintento ${attempt + 1}/${retries} tras fallo de red: ${e.message}`);
       await sleep(wait);
@@ -726,10 +901,19 @@ async function sercopHttpDetail(resp){
 function getCached(url, maxAge = CACHE_TTL){
   const row = dbGet("SELECT response, fetched_at FROM api_cache WHERE url = ?", [url]);
   if(!row) return null;
-  const age = Date.now() - new Date(row.fetched_at).getTime();
-  if(age < maxAge) return row.response;
-  if(age >= CACHE_TTL) dbRun("DELETE FROM api_cache WHERE url = ?", [url]);
+  const age = Date.now() - new Date(row.fetched_at.replace(' ', 'T') + 'Z').getTime();
+  const freshAge = Number.isNaN(age) ? (Date.now() - new Date(row.fetched_at).getTime()) : age;
+  if(freshAge < maxAge) return row.response;
+  if(freshAge >= CACHE_TTL) dbRun("DELETE FROM api_cache WHERE url = ?", [url]);
   return null;
+}
+
+function readStaleCache(url){
+  const body = getCached(url, CACHE_TTL);
+  if(!body) return null;
+  const parsed = JSON.parse(body);
+  if(parsed && typeof parsed === 'object') parsed._nvgStale = true;
+  return parsed;
 }
 
 function setCache(url, response){
@@ -737,14 +921,31 @@ function setCache(url, response){
 }
 
 async function fetchCached(url, opts, force, maxAge = CACHE_TTL){
+  const options = opts || {};
   if(!force){
     const cached = getCached(url, maxAge);
     if(cached) return JSON.parse(cached);
   }
-  const resp = await fetchWithRetry(url, opts);
-  const text = await resp.text();
-  setCache(url, text);
-  return JSON.parse(text);
+  if(isSercopApi(url) && sercopPaused()){
+    if(options.staleOnError){
+      const stale = readStaleCache(url);
+      if(stale) return stale;
+    }
+    throw Object.assign(new Error('portal en pausa'), {code:'SERCOP_PAUSE'});
+  }
+  try{
+    const resp = await fetchWithRetry(url, options);
+    const text = await resp.text();
+    setCache(url, text);
+    return JSON.parse(text);
+  }catch(error){
+    const httpFallback = /HTTP 429|HTTP 5\d\d/.test(String(error?.message || ''));
+    if(options.staleOnError && (isConnectFailure(error) || error.code === 'SERCOP_PAUSE' || httpFallback)){
+      const stale = readStaleCache(url);
+      if(stale) return stale;
+    }
+    throw error;
+  }
 }
 
 const normTxt = s => String(s || '').toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
@@ -951,25 +1152,50 @@ async function fetchSERCOPPages(search, year, buyer, supplier, onProgress, force
   const out = [];
   let lastData = null;
   let livePages = 0;
+  let stalePages = 0;
   do{
     const params = new URLSearchParams({year: query.year, search: query.search, page});
     if(query.buyer) params.set('buyer', query.buyer);
     if(query.supplier) params.set('supplier', query.supplier);
     const url = `${SERCOP_API}/search_ocds?${params.toString()}`;
     const fresh = force ? null : getCached(url, SEARCH_CACHE_MS);
-    if(fresh) lastData = JSON.parse(fresh);
-    else {
-      lastData = await fetchCached(url, {retries: 1}, true);
-      livePages++;
+    try{
+      if(fresh) lastData = JSON.parse(fresh);
+      else {
+        lastData = await fetchCached(url, {retries: 0, staleOnError: true}, true);
+        if(lastData && lastData._nvgStale) stalePages++;
+        else livePages++;
+      }
+    }catch(error){
+      if(!out.length) throw error;
+      console.warn(`  SERCOP página ${page} de "${search}": ${error.message}`);
+      return {
+        out,
+        truncated: false,
+        totalAvailable: out.length,
+        skipped: null,
+        query,
+        cached: livePages === 0 && !stalePages,
+        stale: livePages === 0 && stalePages > 0,
+        partialError: error.message
+      };
     }
     const rows = Array.isArray(lastData?.data) ? lastData.data : (Array.isArray(lastData) ? lastData : []);
     out.push(...rows);
     pages = Number(lastData?.pages || lastData?.total_pages || 1) || 1;
     if(onProgress) onProgress({type:'page', term: progressTerm || search, page, pages, count:out.length});
     page++;
-    if(page <= pages && page <= MAX_PAGES && !fresh) await sleep(PAGE_DELAY);
+    if(page <= pages && page <= MAX_PAGES && !fresh && !(lastData && lastData._nvgStale)) await sleep(PAGE_DELAY);
   } while(page <= pages && page <= MAX_PAGES);
-  return {out, truncated: pages > MAX_PAGES, totalAvailable: out.length, skipped:null, query, cached: livePages === 0};
+  return {
+    out,
+    truncated: pages > MAX_PAGES,
+    totalAvailable: out.length,
+    skipped:null,
+    query,
+    cached: livePages === 0,
+    stale: livePages === 0 && stalePages > 0
+  };
 }
 
 async function fetchSERCOPAllPages(term, year, buyer, supplier, onProgress, force){
@@ -982,6 +1208,8 @@ async function fetchSERCOPAllPages(term, year, buyer, supplier, onProgress, forc
   let skipped = null;
   let lastErr = null;
   let cached = true;
+  let stale = false;
+  let partialError = null;
   let queried = false;
   for(const variant of variants){
     let page;
@@ -1001,6 +1229,8 @@ async function fetchSERCOPAllPages(term, year, buyer, supplier, onProgress, forc
     skipped = null;
     queried = true;
     if(!page.cached) cached = false;
+    if(page.stale) stale = true;
+    if(page.partialError) partialError = page.partialError;
     if(page.truncated) truncated = true;
     for(const row of page.out){
       const k = String(row?.ocid || JSON.stringify([row?.title, row?.buyer, row?.date]));
@@ -1014,7 +1244,7 @@ async function fetchSERCOPAllPages(term, year, buyer, supplier, onProgress, forc
       }
     }
   }
-  const base = {truncated, query, cached: queried && cached, codeOnly};
+  const base = {truncated, query, cached: queried && cached, stale: queried && stale && cached, partialError, codeOnly};
   if(!out.length && !codeOnly.length && skipped && !lastErr) return {out, codeOnly, truncated:false, totalAvailable:0, skipped, query, cached:false};
   if(!out.length && !codeOnly.length && lastErr && !queried) throw lastErr;
   return {out, ...base, totalAvailable: out.length, skipped:null};
@@ -1069,7 +1299,7 @@ async function fetchSERCOPByCPC(cpcCode, year, buyer, onProgress, force){
   do{
     const params = new URLSearchParams({year: query.year, search: query.search, page});
     if(query.buyer) params.set('buyer', query.buyer);
-    lastData = await fetchCached(`${SERCOP_API}/search_ocds?${params.toString()}`, {retries: 1}, force, SEARCH_CACHE_MS);
+    lastData = await fetchCached(`${SERCOP_API}/search_ocds?${params.toString()}`, {retries: 0, staleOnError: true}, force, SEARCH_CACHE_MS);
     const rows = Array.isArray(lastData?.data) ? lastData.data : (Array.isArray(lastData) ? lastData : []);
     const exposesClass = rows.some(row => Array.isArray(row?.items) && row.items.length);
     const filtered = exposesClass ? rows.filter(row => {
@@ -1896,6 +2126,8 @@ async function runMonitor(){
   }
   try{ await detectPipelineChanges(false); }
   catch(e){ console.error('[Monitor] change detection error:', e.message); }
+  try{ await syncDueProcesses(4); }
+  catch(e){ console.error('[Sync] error:', e.message); }
   await sendClosingReminders();
 }
 
@@ -1964,8 +2196,13 @@ function mergeDetail(payload){
     else if(tenders.length) tags.push('tender');
     else if(plannings.length) tags.push('planning');
   }
-  return {tags, modalidad:modality, value, cpcs, supplierNames, publicationDate, lastUpdateDate, closeDate, docs, items, status,
-    rawReleaseCount:releases.length, tendersCount:tenders.length, awardsCount:awards.length, contractsCount:contracts.length, planningsCount:plannings.length};
+  const facts = ocds.extractReleaseFacts(releases);
+  const budgetAmount = facts.budgetAmount != null ? facts.budgetAmount : (value && value.amount != null ? Number(value.amount) : null);
+  return {tags, modalidad:modality, value, cpcs, supplierNames, publicationDate, lastUpdateDate, closeDate: closeDate || facts.closeDate, docs, items, status,
+    rawReleaseCount:releases.length, tendersCount:tenders.length, awardsCount:awards.length, contractsCount:contracts.length, planningsCount:plannings.length,
+    enquiryEnd: facts.enquiryEnd, awardEnd: facts.awardEnd, contractDate: facts.contractDate,
+    buyerId: facts.buyerId, entidadRuc: facts.entidadRuc, partida: facts.partida, budgetAmount,
+    participantes: facts.participantes};
 }
 
 function getRowTitle(row){ return fixEncoding(String(firstNonEmpty(row?.title, row?.tender?.title, row?.description, row?.ocid) ?? '—')); }
@@ -2010,6 +2247,7 @@ function normalizeSearchRow(row, term){
   }
   const title = String(row.title ?? '').trim();
   const desc = String(row.description ?? '').trim();
+  if(titleLooksLikeCode(title, ocid)) row.codigo_proceso = row.codigo_proceso || title;
   if(titleLooksLikeCode(title, ocid) && desc && desc.length > 8) row.title = desc.slice(0, 160);
   return row;
 }
@@ -2094,13 +2332,31 @@ function saveProcess(row, radarId){
   const radar = dbGet("SELECT * FROM radares WHERE id=?", [radarId]);
   if(!rowMatchesRadar(row, radar)) return false;
   if(isDismissed(radarId, row.ocid)) return false;
-  const existing = dbGet("SELECT radar_ids, detail_json, detail_updated_at, first_seen_at FROM procesos WHERE ocid=?", [row.ocid||'']);
+  const existing = dbGet(`SELECT radar_ids, detail_json, detail_updated_at, first_seen_at,
+    entidad_ruc, presupuesto, estado_actual, url_portal, synced_at, codigo_proceso,
+    awards_count, contracts_count, tenders_count FROM procesos WHERE ocid=?`, [row.ocid||'']);
   let radarIds = [radarId];
   if(existing?.radar_ids) radarIds = [...new Set([...existing.radar_ids.split(','), radarId])];
-  dbRun(`INSERT OR REPLACE INTO procesos(ocid, radar_ids, source, title, description, buyer_name, date, modalidad, raw_json, detail_json, detail_updated_at, first_seen_at)
-    VALUES(?,?,?,?,?,?,?,?,?,?,?, COALESCE(?, datetime('now')))`,
-    [row.ocid, radarIds.join(','), row.source||'SERCOP', getRowTitle(row), getRowDescription(row), getBuyerLabel(row), getRowDate(row), getRowModality(row), JSON.stringify(row),
-     existing?.detail_json || null, existing?.detail_updated_at || null, existing?.first_seen_at || null]);
+  const incomingBudget = parseMoney(row.budget) ?? parseMoney(row.amount);
+  const incomingRuc = ocds.extractRuc(row.buyerId || row.buyer?.id || row.buyer?.identifier?.id);
+  const titleNow = String(row.title || '').trim();
+  const incomingCode = row.codigo_proceso || (titleLooksLikeCode(titleNow, row.ocid) ? titleNow : '');
+  const source = row.source || 'SERCOP';
+  const portalUrl = existing?.url_portal || (String(source).toUpperCase() === 'SERCOP' ? sercopPublicUrl(row.ocid) : null);
+  dbRun(`INSERT OR REPLACE INTO procesos(ocid, radar_ids, source, title, description, buyer_name, date, modalidad, raw_json, detail_json, detail_updated_at, first_seen_at,
+      entidad_ruc, presupuesto, estado_actual, url_portal, synced_at, codigo_proceso, awards_count, contracts_count, tenders_count)
+    VALUES(?,?,?,?,?,?,?,?,?,?,?, COALESCE(?, datetime('now')),?,?,?,?,?,?,?,?,?)`,
+    [row.ocid, radarIds.join(','), source, getRowTitle(row), getRowDescription(row), getBuyerLabel(row), getRowDate(row), getRowModality(row), JSON.stringify(row),
+     existing?.detail_json || null, existing?.detail_updated_at || null, existing?.first_seen_at || null,
+     existing?.entidad_ruc || incomingRuc || null,
+     existing?.presupuesto != null ? existing.presupuesto : incomingBudget,
+     existing?.estado_actual || null,
+     portalUrl,
+     existing?.synced_at || null,
+     existing?.codigo_proceso || incomingCode || procCodeTail(row.ocid),
+     existing?.awards_count ?? null,
+     existing?.contracts_count ?? null,
+     existing?.tenders_count ?? null]);
   return true;
 }
 
@@ -2608,6 +2864,7 @@ async function handleSearch(req, res, params){
   };
   let sercopLive = false;
   let sercopCached = false;
+  let sercopStale = false;
   const pendingCodes = [];
 
   function publishSercop(raw, term){
@@ -2624,12 +2881,14 @@ async function handleSearch(req, res, params){
         const term = terms[ti];
         send('term_start', {term, index:ti, total:totalSteps});
         try {
-          const {out, truncated, totalAvailable, skipped, query, codeOnly, cached} = await fetchSERCOPAllPages(term, radar.year, radar.buyer, radar.supplier, (prog) => send('progress', prog), false);
+          const {out, truncated, totalAvailable, skipped, query, codeOnly, cached, stale, partialError} = await fetchSERCOPAllPages(term, radar.year, radar.buyer, radar.supplier, (prog) => send('progress', prog), false);
           if(skipped) send('warning', {message: sercopSkipMessage(term, skipped)});
           else warnSercopParties(query);
-          if(truncated) send('warning', {message:`"${term}": mostrando primeras ${MAX_PAGES} paginas de resultados`, totalAvailable});
+          if(partialError) send('warning', {message:`"${term}": el portal cortó la consulta (${partialError}). Se conservan los procesos ya recibidos.`});
+          else if(truncated) send('warning', {message:`"${term}": mostrando primeras ${MAX_PAGES} paginas de resultados`, totalAvailable});
           if(!skipped){
-            if(cached) sercopCached = true;
+            if(stale) sercopStale = true;
+            else if(cached) sercopCached = true;
             else sercopLive = true;
           }
           for(const raw of out) publishSercop(raw, term);
@@ -2641,6 +2900,7 @@ async function handleSearch(req, res, params){
         }
       }
       if(sercopLive) sourceStatus.sercop = 'disponible';
+      else if(sercopStale) sourceStatus.sercop = 'copia local';
       else if(sercopCached) sourceStatus.sercop = 'en caché';
       else if(sourceStatus.sercop !== 'sin respuesta') sourceStatus.sercop = 'sin resultados';
       if(pendingCodes.length){
@@ -2813,7 +3073,7 @@ async function fetchDetail(ocid, force, opts = {}){
 
   const resp = await fetchWithRetry(`${SERCOP_API}/record?ocid=${encodeURIComponent(ocid)}`, {
     headers:{'Accept':'application/json'},
-    retries: opts.fast ? 0 : undefined,
+    retries: 0,
     connectTimeout: opts.fast ? 4000 : undefined
   });
   const data = await resp.json();
@@ -2847,6 +3107,220 @@ async function fetchDetail(ocid, force, opts = {}){
   }
   saveDetail(ocid, det);
   return det;
+}
+
+// -- Worker de sincronización ----------------------------------------
+// Desacoplado del tablero: la vista lee SQLite. Aquí se pide el registro OCDS
+// solo de las fichas vencidas. Activas (convocatoria, preguntas, calificación)
+// cada 3 horas. Adjudicadas o con contrato, una vez al día. Tope por ciclo para
+// respetar el cupo del portal.
+const SYNC_BATCH = 4;
+let syncRunning = false;
+let syncPausedUntil = 0;
+
+function sqliteUtcIso(value){
+  const text = String(value || '').trim();
+  if(!text) return null;
+  if(text.includes('T')) return text;
+  const time = new Date(text.replace(' ', 'T') + 'Z');
+  return Number.isNaN(time.getTime()) ? text : time.toISOString();
+}
+
+function recordProcessChange(ocid, campo, before, after){
+  if(String(before ?? '') === String(after ?? '')) return false;
+  dbRun("INSERT INTO proceso_cambios(ocid, campo, valor_anterior, valor_nuevo) VALUES(?,?,?,?)",
+    [ocid, campo, String(before ?? ''), String(after ?? '')]);
+  return true;
+}
+
+function briefRows(rows, format){
+  return (rows || []).map(format).sort().join('; ').slice(0, 500);
+}
+
+function applyOperational(ocid, detail){
+  const prev = dbGet("SELECT * FROM procesos WHERE ocid=?", [ocid]);
+  if(!prev || !detail) return null;
+  const facts = {
+    enquiryEnd: detail.enquiryEnd || null,
+    closeDate: detail.closeDate || null,
+    awardEnd: detail.awardEnd || null,
+    contractDate: detail.contractDate || null,
+    contractsCount: detail.contractsCount || 0,
+    awardsCount: detail.awardsCount || 0,
+    tendersCount: detail.tendersCount || 0
+  };
+  const now = Date.now();
+  const etapa = ocds.operationalStage(facts, now);
+  const cronograma = ocds.cronogramaFromFacts(facts, now);
+  const participantes = Array.isArray(detail.participantes) ? detail.participantes : [];
+  const presupuesto = detail.budgetAmount != null ? detail.budgetAmount : (prev.presupuesto != null ? prev.presupuesto : null);
+  const entidadRuc = detail.entidadRuc || prev.entidad_ruc || null;
+  const prevEtapas = dbAll("SELECT etapa_nombre, fecha_limite FROM cronograma_etapas WHERE ocid=?", [ocid]);
+  const prevPartes = dbAll("SELECT proveedor_nombre, estado_oferta, monto_oferta FROM participantes_proceso WHERE ocid=?", [ocid]);
+  if((prev.estado_actual || '') !== etapa){
+    recordProcessChange(ocid, 'estado_actual', prev.estado_actual || '', etapa);
+    if(prev.estado_actual){
+      dbRun("INSERT INTO alerts(radar_id, ocid, title, buyer_name, alert_type) VALUES(?,?,?,?,?)",
+        [null, ocid, `Etapa: ${prev.estado_actual} → ${etapa}`, prev.buyer_name || '', 'estado']);
+    }
+  }
+  if(prev.synced_at){
+    const beforeBudget = prev.presupuesto == null ? '' : String(prev.presupuesto);
+    const afterBudget = presupuesto == null ? '' : String(presupuesto);
+    if(beforeBudget !== afterBudget) recordProcessChange(ocid, 'presupuesto', beforeBudget, afterBudget);
+    const beforeEtapas = briefRows(prevEtapas, row => `${row.etapa_nombre}@${row.fecha_limite}`);
+    const afterEtapas = briefRows(cronograma, row => `${row.etapa_nombre}@${row.fecha_limite}`);
+    if(beforeEtapas !== afterEtapas) recordProcessChange(ocid, 'cronograma', beforeEtapas, afterEtapas);
+    const beforePartes = briefRows(prevPartes, row => `${row.proveedor_nombre}:${row.estado_oferta}:${row.monto_oferta ?? ''}`);
+    const afterPartes = briefRows(participantes, row => `${row.proveedor_nombre}:${row.estado_oferta}:${row.monto_oferta ?? ''}`);
+    if(beforePartes !== afterPartes) recordProcessChange(ocid, 'participantes', beforePartes, afterPartes);
+  }
+  dbRun("DELETE FROM cronograma_etapas WHERE ocid=?", [ocid]);
+  const insertEtapa = db.prepare("INSERT INTO cronograma_etapas(ocid, etapa_nombre, fecha_limite, completada) VALUES(?,?,?,?)");
+  for(const etapaRow of cronograma){
+    insertEtapa.run(ocid, etapaRow.etapa_nombre, etapaRow.fecha_limite, etapaRow.completada ? 1 : 0);
+  }
+  dbRun("DELETE FROM participantes_proceso WHERE ocid=?", [ocid]);
+  const insertParte = db.prepare("INSERT OR IGNORE INTO participantes_proceso(ocid, proveedor_ruc, proveedor_nombre, estado_oferta, monto_oferta) VALUES(?,?,?,?,?)");
+  for(const parte of participantes){
+    insertParte.run(ocid, parte.proveedor_ruc || '', parte.proveedor_nombre || '', parte.estado_oferta || '', parte.monto_oferta);
+  }
+  const syncedAt = new Date().toISOString();
+  dbRun(`UPDATE procesos SET entidad_ruc=COALESCE(?, entidad_ruc), presupuesto=?, estado_actual=?, url_portal=COALESCE(url_portal, ?),
+      synced_at=?, awards_count=?, contracts_count=?, tenders_count=? WHERE ocid=?`,
+    [entidadRuc, presupuesto, etapa, sercopPublicUrl(ocid), syncedAt, facts.awardsCount, facts.contractsCount, facts.tendersCount, ocid]);
+  return {ocid, etapa, syncedAt};
+}
+
+async function syncDueProcesses(limit){
+  if(syncRunning) return {ok:true, skipped:true, reason:'en curso', due:0, updated:[]};
+  syncRunning = true;
+  const updated = [];
+  let due = [];
+  try{
+    if(sercopPaused() || Date.now() < syncPausedUntil){
+      console.log('  [Sync] portal en pausa; el tablero conserva la última copia');
+      return {ok:true, paused:true, due:0, updated};
+    }
+    const rows = dbAll(`SELECT ocid, source, estado_actual, synced_at FROM procesos
+      WHERE UPPER(COALESCE(source,'SERCOP'))='SERCOP'`);
+    const now = Date.now();
+    due = rows.filter(row => ocds.isSyncDue(row, now)).slice(0, Math.max(1, Number(limit) || SYNC_BATCH));
+    for(const row of due){
+      if(sercopPaused()) break;
+      try{
+        const detail = await fetchDetail(row.ocid, true, {fast:true});
+        if(!detail) continue;
+        const applied = applyOperational(row.ocid, detail);
+        if(applied) updated.push(applied.ocid);
+      }catch(error){
+        console.warn(`  [Sync] ${row.ocid}: ${error.message}`);
+        if(/429/.test(error.message || '')) syncPausedUntil = Date.now() + 60 * 1000;
+        if(error.code === 'SERCOP_PAUSE' || isConnectFailure(error) || /429|pausa/.test(error.message || '')) break;
+      }
+    }
+    if(due.length) console.log(`  [Sync] ${updated.length} fichas actualizadas de ${due.length} vencidas`);
+    return {ok:true, paused:sercopPaused() && updated.length < due.length, due:due.length, updated};
+  } finally {
+    syncRunning = false;
+  }
+}
+
+function presentTableroItem(row, etapas, now){
+  const estado = ocds.stageFromStored(row, etapas, now);
+  const luz = ocds.semaphore(etapas.map(item => ({...item, completada: !!item.completada})), estado, now);
+  return {
+    ocid: row.ocid,
+    codigo: row.codigo_proceso || procCodeTail(row.ocid),
+    objeto: readableProcessTitle(row.title, row.description, row.ocid),
+    entidad: row.buyer_name || '',
+    entidadRuc: row.entidad_ruc || '',
+    tipo: row.modalidad || '',
+    presupuesto: row.presupuesto,
+    estado,
+    semaforo: luz.color,
+    semaforoDetalle: luz.label,
+    urgente: luz.urgente,
+    proximoCierre: luz.fecha,
+    horasRestantes: luz.horas,
+    url: row.url_portal || sercopPublicUrl(row.ocid),
+    syncedAt: row.synced_at,
+    source: row.source || 'SERCOP'
+  };
+}
+
+function getTablero(){
+  const rows = dbAll(`SELECT ocid, title, description, buyer_name, entidad_ruc, modalidad, presupuesto,
+      estado_actual, url_portal, codigo_proceso, synced_at, date, source, awards_count, contracts_count, tenders_count
+    FROM procesos WHERE UPPER(COALESCE(source,'SERCOP'))='SERCOP' ORDER BY date DESC`);
+  const etapas = dbAll("SELECT ocid, etapa_nombre, fecha_limite, completada FROM cronograma_etapas");
+  const byOcid = new Map();
+  for(const etapa of etapas){
+    if(!byOcid.has(etapa.ocid)) byOcid.set(etapa.ocid, []);
+    byOcid.get(etapa.ocid).push(etapa);
+  }
+  const now = Date.now();
+  const items = [];
+  const pendientes = [];
+  for(const row of rows){
+    if(!row.synced_at){
+      pendientes.push({
+        ocid: row.ocid,
+        codigo: row.codigo_proceso || procCodeTail(row.ocid),
+        objeto: readableProcessTitle(row.title, row.description, row.ocid),
+        entidad: row.buyer_name || '',
+        presupuesto: row.presupuesto,
+        url: row.url_portal || sercopPublicUrl(row.ocid)
+      });
+      continue;
+    }
+    items.push(presentTableroItem(row, byOcid.get(row.ocid) || [], now));
+  }
+  return {
+    etapas: ocds.ETAPAS,
+    items,
+    pendientes,
+    pausa: sercopPaused(),
+    meta: {activosHoras: 3, historicosHoras: 24}
+  };
+}
+
+function getFicha(ocid){
+  const row = getProcessRow(ocid);
+  if(!row) return null;
+  const etapas = dbAll("SELECT etapa_nombre, fecha_limite, completada FROM cronograma_etapas WHERE ocid=? ORDER BY fecha_limite", [ocid]);
+  const participantes = dbAll("SELECT proveedor_ruc, proveedor_nombre, estado_oferta, monto_oferta FROM participantes_proceso WHERE ocid=? ORDER BY id", [ocid]);
+  const cambios = dbAll("SELECT campo, valor_anterior, valor_nuevo, created_at FROM proceso_cambios WHERE ocid=? ORDER BY id DESC LIMIT 100", [ocid])
+    .map(row => ({...row, created_at: sqliteUtcIso(row.created_at)}));
+  let detail = null;
+  try { detail = row.detail_json ? JSON.parse(row.detail_json) : null; } catch(_){ detail = null; }
+  const documentos = Array.isArray(detail?.docs) ? detail.docs.filter(doc => doc && /^https?:\/\//i.test(String(doc.url || ''))).map(doc => ({
+    titulo: doc.title || doc.documentType || 'Documento',
+    url: doc.url,
+    formato: doc.format || ''
+  })) : [];
+  const now = Date.now();
+  const estado = row.synced_at ? ocds.stageFromStored(row, etapas, now) : null;
+  const semaforo = estado ? ocds.semaphore(etapas.map(item => ({...item, completada: !!item.completada})), estado, now) : null;
+  return {
+    ocid: row.ocid,
+    codigo: row.codigo_proceso || procCodeTail(row.ocid),
+    objeto: readableProcessTitle(row.title, row.description, row.ocid),
+    descripcion: row.description || '',
+    entidad: row.buyer_name || '',
+    entidadRuc: row.entidad_ruc || '',
+    tipo: row.modalidad || '',
+    presupuesto: row.presupuesto,
+    partida: detail?.partida || '',
+    estado,
+    semaforo,
+    url: row.url_portal || (String(row.source || 'SERCOP').toUpperCase() === 'SERCOP' ? sercopPublicUrl(row.ocid) : ''),
+    syncedAt: row.synced_at,
+    cronograma: etapas.map(item => ({etapa: item.etapa_nombre, fechaLimite: item.fecha_limite, completada: !!item.completada})),
+    participantes,
+    documentos,
+    cambios
+  };
 }
 
 // -- Autenticación (endpoints) ---------------------------------------
@@ -3149,6 +3623,21 @@ const server = http.createServer(async (req, res) => {
         deletePipelineEntry(ocid);
         return json(res, 200, {ok:true});
       }
+    }
+
+    // -- Tablero operativo (lee la base; el worker actualiza aparte) --
+    if(pathname === '/api/tablero' && req.method === 'GET'){
+      return json(res, 200, getTablero());
+    }
+    if(pathname === '/api/sync' && req.method === 'POST'){
+      const result = await syncDueProcesses(SYNC_BATCH);
+      return json(res, 200, result);
+    }
+    const fichaMatch = pathname.match(/^\/api\/procesos\/(.+)\/ficha$/);
+    if(fichaMatch && req.method === 'GET'){
+      const ficha = getFicha(decodeURIComponent(fichaMatch[1]));
+      if(!ficha) return json(res, 404, {error:'proceso no encontrado'});
+      return json(res, 200, ficha);
     }
 
     // -- Search (SSE) --
