@@ -1372,4 +1372,191 @@ describe('Correo por Microsoft Graph (unitario, fetch simulado)', () => {
   });
 });
 
+describe('normalización OCDS', () => {
+  const ocds = require('./ocds');
+  const now = Date.parse('2026-06-15T15:00:00Z');
+
+  it('arma cronograma, etapa y semáforo desde un registro', () => {
+    const releases = [{
+      ocid: 'ocds-5wno2w-SIE-EJ-2026-10',
+      tag: ['tender'],
+      buyer: {id: 'EC-RUC-1768152130001', name: 'EMPRESA EJEMPLO'},
+      planning: {budget: {id: '530101', description: 'Servicios de seguridad', amount: {amount: 60000, currency: 'USD'}}},
+      tender: {
+        title: 'SIE-EJ-2026-10',
+        description: 'Servicio de monitoreo de ciberseguridad',
+        enquiryPeriod: {endDate: '2026-06-16T08:00:00Z'},
+        tenderPeriod: {endDate: '2026-06-30T23:59:00Z'},
+        awardPeriod: {endDate: '2026-07-20T23:59:00Z'},
+        value: {amount: 59400, currency: 'USD'},
+        tenderers: [{id: 'EC-RUC-1790011223001', name: 'PROVEEDOR UNO'}]
+      }
+    }];
+    const facts = ocds.extractReleaseFacts(releases);
+    assert.equal(facts.entidadRuc, '1768152130001');
+    assert.equal(facts.partida, '530101');
+    assert.equal(facts.budgetAmount, 60000);
+    assert.equal(facts.participantes[0].proveedor_nombre, 'PROVEEDOR UNO');
+    assert.equal(facts.participantes[0].estado_oferta, 'Participante');
+    const cronograma = ocds.cronogramaFromFacts(facts, now);
+    assert.deepEqual(cronograma.map(row => row.etapa_nombre), ['Preguntas', 'Entrega de ofertas', 'Adjudicación']);
+    const etapa = ocds.operationalStage({...facts, tendersCount: 1, awardsCount: 0, contractsCount: 0}, now);
+    assert.equal(etapa, 'Preguntas y Respuestas');
+    const luz = ocds.semaphore(cronograma, etapa, now);
+    assert.equal(luz.color, 'amarillo');
+    assert.equal(luz.urgente, true);
+    assert.equal(luz.fecha, facts.enquiryEnd);
+  });
+
+  it('usa el cierre de la puja cuando el periodo de ofertas no trae fecha fin', () => {
+    const facts = ocds.extractReleaseFacts([{
+      tender: {enquiryPeriod: {endDate: '2026-09-17T23:00:00Z'}, tenderPeriod: {startDate: '2026-09-11T23:00:00Z'}},
+      auctions: [{period: {endDate: '2026-10-12T15:30:00Z'}}]
+    }]);
+    assert.equal(facts.closeDate, '2026-10-12T15:30:00.000Z');
+    const cronograma = ocds.cronogramaFromFacts(facts, Date.parse('2026-10-01T00:00:00Z'));
+    assert.equal(cronograma.find(row => row.etapa_nombre === 'Entrega de ofertas').fecha_limite, facts.closeDate);
+  });
+
+  it('no trata el periodo de adjudicación como etapa adjudicada si aún no hay award', () => {
+    const etapa = ocds.operationalStage({
+      enquiryEnd: '2026-06-01T00:00:00Z',
+      closeDate: '2026-06-20T00:00:00Z',
+      awardEnd: '2026-06-10T00:00:00Z',
+      tendersCount: 1,
+      awardsCount: 0,
+      contractsCount: 0
+    }, Date.parse('2026-06-15T00:00:00Z'));
+    assert.equal(etapa, 'Convocatoria');
+  });
+
+  it('clasifica calificación, adjudicación y finalizado', () => {
+    const past = Date.parse('2026-08-01T00:00:00Z');
+    assert.equal(ocds.operationalStage({closeDate: '2026-07-01T00:00:00Z', tendersCount: 1, awardsCount: 0, contractsCount: 0}, past), 'Calificación');
+    assert.equal(ocds.operationalStage({awardsCount: 1, contractsCount: 0, tendersCount: 1}, past), 'Adjudicación');
+    assert.equal(ocds.operationalStage({awardsCount: 1, contractsCount: 1, tendersCount: 1}, past), 'Finalizado');
+    const cerrada = ocds.semaphore([{etapa_nombre: 'Entrega de ofertas', fecha_limite: '2026-07-01T00:00:00Z', completada: true}], 'Calificación', past);
+    assert.equal(cerrada.color, 'rojo');
+    assert.equal(cerrada.label, 'plazo vencido');
+  });
+
+  it('marca verde con más de 48 horas y amarillo entre 24 y 48', () => {
+    const base = Date.parse('2026-06-15T12:00:00Z');
+    const verde = ocds.semaphore([
+      {etapa_nombre: 'Entrega de ofertas', fecha_limite: '2026-06-20T12:00:00Z', completada: false}
+    ], 'Convocatoria', base);
+    assert.equal(verde.color, 'verde');
+    const medio = ocds.semaphore([
+      {etapa_nombre: 'Entrega de ofertas', fecha_limite: '2026-06-17T00:00:00Z', completada: false}
+    ], 'Convocatoria', base);
+    assert.equal(medio.color, 'amarillo');
+    assert.equal(medio.urgente, false);
+  });
+
+  it('prioriza al adjudicado y lee el estado de la oferta', () => {
+    const facts = ocds.extractReleaseFacts([{
+      tender: {tenderers: [{id: 'EC-RUC-1790011223001', name: 'PROVEEDOR UNO'}]},
+      awards: [{status: 'active', value: {amount: 1000}, suppliers: [{id: 'EC-RUC-1790011223001', name: 'PROVEEDOR UNO'}]}],
+      bids: {details: [{status: 'disqualified', value: {amount: 900}, tenderers: [{id: 'EC-RUC-0999999999001', name: 'OTRO'}]}]}
+    }]);
+    const byName = Object.fromEntries(facts.participantes.map(item => [item.proveedor_nombre, item]));
+    assert.equal(byName['PROVEEDOR UNO'].estado_oferta, 'Adjudicado');
+    assert.equal(byName['PROVEEDOR UNO'].monto_oferta, 1000);
+    assert.equal(byName.OTRO.estado_oferta, 'Descalificado');
+  });
+
+  it('vence la sincronización a las 3 horas si sigue activo y a las 24 si ya cerró', () => {
+    const now = Date.parse('2026-06-15T12:00:00Z');
+    assert.equal(ocds.isSyncDue({synced_at: '2026-06-15T10:00:00Z', estado_actual: 'Convocatoria'}, now), false);
+    assert.equal(ocds.isSyncDue({synced_at: '2026-06-15T08:00:00Z', estado_actual: 'Calificación'}, now), true);
+    assert.equal(ocds.isSyncDue({synced_at: '2026-06-14T14:00:00Z', estado_actual: 'Adjudicación'}, now), false);
+    assert.equal(ocds.isSyncDue({synced_at: '2026-06-14T11:00:00Z', estado_actual: 'Finalizado'}, now), true);
+    assert.equal(ocds.isSyncDue({synced_at: null, estado_actual: null}, now), true);
+  });
+});
+
+describe('tablero operativo', () => {
+  const Database = require('better-sqlite3');
+  const ocid = 'ocds-5wno2w-TABLERO-LOCAL-2026';
+
+  async function wipe(){
+    const db = new Database(TEST_DB);
+    db.prepare('DELETE FROM proceso_cambios WHERE ocid=?').run(ocid);
+    db.prepare('DELETE FROM participantes_proceso WHERE ocid=?').run(ocid);
+    db.prepare('DELETE FROM cronograma_etapas WHERE ocid=?').run(ocid);
+    db.prepare('DELETE FROM procesos WHERE ocid=?').run(ocid);
+    db.close();
+  }
+
+  it('la ficha del tablero responde 404 si el proceso no está en la base', async () => {
+    const missing = await api('/api/procesos/' + encodeURIComponent('ocds-inexistente') + '/ficha');
+    assert.equal(missing.status, 404);
+  });
+
+  it('la sincronización del tablero no consulta el portal si no hay fichas vencidas', async () => {
+    const db = new Database(TEST_DB);
+    const previous = db.prepare("SELECT ocid, synced_at FROM procesos WHERE UPPER(COALESCE(source,'SERCOP'))='SERCOP'").all();
+    const fresh = new Date().toISOString();
+    db.prepare("UPDATE procesos SET synced_at=? WHERE UPPER(COALESCE(source,'SERCOP'))='SERCOP'").run(fresh);
+    db.close();
+    const started = Date.now();
+    try{
+      const response = await api('/api/sync', {method:'POST', body:'{}'});
+      assert.equal(response.status, 200);
+      const body = response.json();
+      assert.equal(body.ok, true);
+      if(!body.skipped) assert.equal(body.due, 0);
+      assert.ok(Date.now() - started < 3000);
+    } finally {
+      const restore = new Database(TEST_DB);
+      for(const row of previous) restore.prepare('UPDATE procesos SET synced_at=? WHERE ocid=?').run(row.synced_at, row.ocid);
+      restore.close();
+    }
+  });
+
+  it('el tablero lee la base local con semáforo y ficha', async () => {
+    await wipe();
+    const db = new Database(TEST_DB);
+    const preguntas = new Date(Date.now() + 72 * 60 * 60 * 1000).toISOString();
+    try{
+      db.prepare(`INSERT INTO procesos(ocid, radar_ids, source, title, description, buyer_name, date, modalidad,
+          entidad_ruc, presupuesto, estado_actual, url_portal, codigo_proceso, synced_at, awards_count, contracts_count, tenders_count)
+        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(
+        ocid, '', 'SERCOP', 'Servicio de soporte de la red', 'Servicio de soporte de la red',
+        'EMPRESA PUBLICA DE PRUEBA', '2026-04-01', 'Menor Cuantía',
+        '1760001550001', 15000, 'Preguntas y Respuestas',
+        'https://datosabiertos.compraspublicas.gob.ec/PLATAFORMA/ocds/' + ocid,
+        'SIE-LOCAL-2026-1', new Date().toISOString(), 0, 0, 1
+      );
+      db.prepare('INSERT INTO cronograma_etapas(ocid, etapa_nombre, fecha_limite, completada) VALUES(?,?,?,0)').run(ocid, 'Preguntas', preguntas);
+      db.prepare('INSERT INTO participantes_proceso(ocid, proveedor_ruc, proveedor_nombre, estado_oferta, monto_oferta) VALUES(?,?,?,?,?)')
+        .run(ocid, '1790001111001', 'PROVEEDOR LOCAL', 'Participante', null);
+      db.prepare('INSERT INTO proceso_cambios(ocid, campo, valor_anterior, valor_nuevo) VALUES(?,?,?,?)')
+        .run(ocid, 'estado_actual', '', 'Preguntas y Respuestas');
+    } finally {
+      db.close();
+    }
+    try{
+      const board = await api('/api/tablero');
+      assert.equal(board.status, 200);
+      const payload = board.json();
+      const item = payload.items.find(row => row.ocid === ocid);
+      assert.ok(item, 'el proceso guardado debe aparecer en el tablero');
+      assert.equal(item.estado, 'Preguntas y Respuestas');
+      assert.equal(item.semaforo, 'verde');
+      assert.equal(item.entidadRuc, '1760001550001');
+      assert.equal(item.presupuesto, 15000);
+      const ficha = await api('/api/procesos/' + encodeURIComponent(ocid) + '/ficha');
+      assert.equal(ficha.status, 200);
+      const detail = ficha.json();
+      assert.equal(detail.cronograma[0].etapa, 'Preguntas');
+      assert.equal(detail.participantes[0].proveedor_nombre, 'PROVEEDOR LOCAL');
+      assert.equal(detail.cambios[0].campo, 'estado_actual');
+      assert.equal(detail.codigo, 'SIE-LOCAL-2026-1');
+    } finally {
+      await wipe();
+    }
+  });
+});
+
 
