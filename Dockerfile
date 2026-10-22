@@ -12,6 +12,9 @@ COPY package.json package-lock.json ./
 RUN npm ci --omit=dev
 
 COPY auth.js integrations.js ocds.js server.js index.js sercop.html login.html ./
+# Si esto falla, la imagen no sale: un proceso que muere al arrancar deja
+# soce.opsh.io sin upstream en el puerto 3210.
+RUN node -e "const db=require('better-sqlite3')(':memory:'); db.close(); require('./ocds'); require('./auth'); require('./integrations');"
 RUN mkdir -p /app/data
 
 ENV NODE_ENV=production \

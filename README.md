@@ -46,9 +46,9 @@ npm test
 
 El dominio libre `soce.opsh.io` va en `openship.json` asignado al puerto **3210**,
 el mismo que publica el contenedor. OpenShip registra la ruta solo si ese
-contenedor sigue **en ejecución** y tiene publicado el 3210. Si el proceso sale
-al abrir SQLite (el directorio de `NVG_DB` no existía) el panel deja el dominio
-en «Verificado» y muestra «El enrutamiento del dominio necesita atención».
+contenedor sigue **en ejecución** y tiene publicado el 3210. El proceso abre
+el puerto antes de SQLite y reintenta si el volumen aún no se puede escribir,
+para no dejar el dominio en «El enrutamiento del dominio necesita atención».
 
 1. **Escucha detrás del proxy**: `NVG_HOST=0.0.0.0`. Si OpenShip inyecta `PORT`
    y no hay `NVG_HOST`, el servidor escucha en `0.0.0.0` en ese puerto.

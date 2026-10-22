@@ -2,7 +2,6 @@ const http = require('node:http');
 const https = require('node:https');
 const dns = require('node:dns');
 const crypto = require('node:crypto');
-const Database = require('better-sqlite3');
 const fs = require('node:fs');
 const path = require('node:path');
 const auth = require('./auth');
@@ -149,10 +148,14 @@ async function sendClosingReminders(){
 }
 
 let db;
+function openSqlite(file, opts){
+  const SQLite = require('better-sqlite3');
+  return new SQLite(file, opts);
+}
 function initDB(){
   const file = path.resolve(DB_FILE);
   fs.mkdirSync(path.dirname(file), { recursive: true });
-  db = new Database(file);
+  db = openSqlite(file);
   db.pragma('journal_mode = WAL');
   db.pragma('synchronous = NORMAL');
   db.exec(`CREATE TABLE IF NOT EXISTS radares(
@@ -3397,6 +3400,16 @@ const server = http.createServer(async (req, res) => {
 
   const {pathname, params} = parseUrl(req);
 
+  // El puerto tiene que responder aunque SQLite aún no abra: si el proceso
+  // sale, OpenShip no resuelve el upstream de soce.opsh.io.
+  if(!db && pathname.startsWith('/api/')){
+    if(pathname === '/api/auth/session' && req.method === 'GET'){
+      return json(res, 200, {authenticated:false, starting:true});
+    }
+    res.setHeader('Retry-After', '3');
+    return json(res, 503, {error:'la base de datos todavía no está lista'});
+  }
+
   try {
     // -- Público: página de login y endpoints de autenticación ----
     if(pathname === '/login' || pathname === '/login.html'){
@@ -3483,7 +3496,7 @@ const server = http.createServer(async (req, res) => {
           // Valida el archivo ANTES de tocar la base en uso.
           let check = null;
           try {
-            check = new Database(tmp, {readonly:true});
+            check = openSqlite(tmp, {readonly:true});
             const row = check.prepare("SELECT name FROM sqlite_master WHERE type='table' LIMIT 1").get();
             if(!row) throw new Error('no es una base SQLite válida');
           } catch(e){
@@ -4000,15 +4013,13 @@ server.on('error', (err) => {
   process.exit(1);
 });
 
-try{
-  initDB();
-}catch(e){
-  console.error(`No se pudo abrir la base de datos (${DB_FILE}): ${e.message}`);
-  console.error('Ese directorio tiene que existir y ser escribible. En OpenShip monta un volumen ahí (radar-data:/app/data).');
-  process.exit(1);
-}
-bootstrapAuth().then(() => {
-  server.listen(PORT, HOST, () => {
+let booting = false;
+function boot(){
+  if(booting) return;
+  booting = true;
+  Promise.resolve().then(async () => {
+    initDB();
+    await bootstrapAuth();
     console.log(`\n  Radar SERCOP v11 — http://${HOST}:${PORT}`);
     console.log(`  Database: ${DB_FILE}`);
     if(AUTH_ENABLED){
@@ -4037,14 +4048,18 @@ bootstrapAuth().then(() => {
     else console.log(`  Acceso: expuesto en ${HOST} — asegúrate de estar detrás del proxy con TLS.`);
     console.log('');
     startMonitor();
+  }).catch(e => {
+    try{ if(db) db.close(); }catch(_){}
+    db = null;
+    console.error(`No se pudo abrir la base de datos (${DB_FILE}): ${e.message}`);
+    console.error('El proceso sigue escuchando para que OpenShip enrute el dominio. Reintento en 3 s. El volumen radar-data tiene que estar montado en /app/data y ser escribible.');
+    setTimeout(() => { booting = false; boot(); }, 3000);
   });
-}).catch(e => {
-  console.error('No se pudo inicializar la autenticación:', e.message);
-  process.exit(1);
-});
+}
 
 // Protecciones de red (slowloris / conexiones colgadas).
 server.headersTimeout = 20000;
 server.requestTimeout = 0; // 0 = sin corte de peticiones largas (necesario para SSE /api/search).
 server.keepAliveTimeout = 65000;
 server.timeout = 0;        // sin timeout de inactividad de socket (streams SSE abiertos).
+server.listen(PORT, HOST, boot);
