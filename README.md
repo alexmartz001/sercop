@@ -13,7 +13,7 @@ La auditoría de seguridad está en [`AUDITORIA.md`](./AUDITORIA.md).
 
 ## 1. Requisitos
 
-- **Node.js ≥ 18** (probado en v24). El envío por Graph usa `fetch` nativo.
+- **Node.js 24.22.1** o posterior (LTS con los parches del 21 de octubre de 2026). La imagen de despliegue fija `node:24.22.1-bookworm-slim`. El envío por Graph usa `fetch` nativo.
 - Un **volumen persistente** para la base de datos SQLite (`NVG_DB`).
 
 ## 2. Arranque rápido
@@ -46,9 +46,9 @@ npm test
 
 El dominio libre `soce.opsh.io` va en `openship.json` asignado al puerto **3210**,
 el mismo que publica el contenedor. OpenShip registra la ruta solo si ese
-contenedor sigue **en ejecución** y tiene publicado el 3210. Si el proceso sale
-al abrir SQLite (el directorio de `NVG_DB` no existía) el panel deja el dominio
-en «Verificado» y muestra «El enrutamiento del dominio necesita atención».
+contenedor sigue **en ejecución** y tiene publicado el 3210. El proceso abre
+el puerto antes de SQLite y reintenta si el volumen aún no se puede escribir,
+para no dejar el dominio en «El enrutamiento del dominio necesita atención».
 
 1. **Escucha detrás del proxy**: `NVG_HOST=0.0.0.0`. Si OpenShip inyecta `PORT`
    y no hay `NVG_HOST`, el servidor escucha en `0.0.0.0` en ese puerto.

@@ -1,4 +1,6 @@
-FROM node:22-bookworm-slim
+# Node.js 24.22.1 (LTS, 21/10/2026). El tag flotante node:24 puede quedar
+# en una compilación anterior a los parches de severidad alta.
+FROM node:24.22.1-bookworm-slim
 
 RUN apt-get update \
   && apt-get install -y --no-install-recommends python3 make g++ \
@@ -9,7 +11,10 @@ WORKDIR /app
 COPY package.json package-lock.json ./
 RUN npm ci --omit=dev
 
-COPY auth.js integrations.js server.js index.js sercop.html login.html ./
+COPY auth.js integrations.js ocds.js server.js index.js sercop.html login.html ./
+# Si esto falla, la imagen no sale: un proceso que muere al arrancar deja
+# soce.opsh.io sin upstream en el puerto 3210.
+RUN node -e "const db=require('better-sqlite3')(':memory:'); db.close(); require('./ocds'); require('./auth'); require('./integrations');"
 RUN mkdir -p /app/data
 
 ENV NODE_ENV=production \
