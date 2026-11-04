@@ -1560,6 +1560,97 @@ describe('tablero operativo', () => {
 });
 
 
+describe('Portal SOCE', () => {
+  const portal = require('./portal');
+  const descripcion = `<table><tbody><tr><th width="35%"> Entidad:</th><td width="65%">ENTIDAD UNO</td></tr>
+    <tr><th>Objeto de Proceso:</th><td>Suscripción de plataforma XDR</td></tr>
+    <tr><th>C&oacute;digo:</th><td>SIE-ENT-2026-002</td></tr>
+    <tr><th>Presupuesto Referencial Total (Sin Iva):</th><td>USD 139,000.00</td></tr>
+    <tr><th>Tipo de Contratación:</th><td>Subasta Inversa Electrónica - </td></tr>
+    <tr><th>Funcionario encargado del proceso:</th><td>persona@example.gob.ec</td></tr>
+    <tr><th>Estado del Proceso:</th><td> <strong>Entrega de Propuesta</strong></td></tr></tbody></table>`;
+  const productos = `<table><tbody><tr><td colspan="5"><font><b>Lote  1  - Cpc:  73390 /CONCESION DE LICENCIAS</b>  / (CONCESION DE LICENCIAS) </t></font><td><font>Umbral VAE: 0.00%</font></td></tr>
+    <tr><td>733900111</td><td>OTORGAR EL USO<br></td><td>1</td><td>Unidad</td><td>USD 139,000.00</td><td align='left'>USD 139,000.00</td></tr>
+    <tr ><td  colspan='5'><b>SUB.TOTAL LOTE</b></td><td  align='left'><b>USD 139,000.00</b></td></tr></tbody></table>`;
+
+  it('acepta el enlace del portal o el identificador, y nada más', () => {
+    assert.equal(portal.idDesdeTexto('https://www.compraspublicas.gob.ec/ProcesoContratacion/compras/PC/informacionProcesoContratacion2.cpe?idSoliCompra=2029690,'), '2029690');
+    assert.equal(portal.idDesdeTexto(' 2029690, '), '2029690');
+    assert.equal(portal.idDesdeTexto('Ab_c-9'), 'Ab_c-9');
+    assert.equal(portal.idDesdeTexto('https://otro.example/x?idSoliCompra=2029690'), null);
+    assert.equal(portal.idDesdeTexto('https://compraspublicas.gob.ec.example.com/?id=1'), null);
+    assert.equal(portal.idDesdeTexto('1&tab=9'), null);
+    assert.equal(portal.idDesdeTexto(''), null);
+  });
+
+  it('lee la descripción y no conserva el correo del funcionario', () => {
+    const d = portal.parsearDescripcion(descripcion);
+    assert.equal(d.codigo, 'SIE-ENT-2026-002');
+    assert.equal(d.presupuesto, 139000);
+    assert.equal(d.modalidad, 'Subasta Inversa Electrónica');
+    assert.equal(d.estado, 'Entrega de Propuesta');
+    assert.ok(!JSON.stringify(d).includes('persona@'));
+  });
+
+  it('lee las fechas con la hora de Ecuador', () => {
+    const fechas = portal.parsearFechas('<tr><th>Fecha Límite entrega Ofertas</th><td width="140px">2026-11-05 14:00:00</td><td>Fecha máxima.</td></tr><tr><th>Sin fecha</th><td>—</td></tr>');
+    assert.deepEqual(fechas, [{etapa: 'Fecha Límite entrega Ofertas', fecha: '2026-11-05T14:00:00-05:00'}]);
+  });
+
+  it('el semáforo reconoce los plazos publicados por el portal', () => {
+    const ocds = require('./ocds');
+    const ahora = Date.parse('2026-11-04T06:30:00-05:00');
+    const etapas = [
+      ['Fecha Límite de Preguntas', '2026-10-26T14:00:00-05:00', 1],
+      ['Fecha Límite entrega Ofertas', '2026-11-05T14:00:00-05:00', 0]
+    ].map(([nombre, fecha_limite, completada]) => ({etapa_nombre: portal.etapaOperativa(nombre), fecha_limite, completada}));
+    assert.equal(ocds.semaphore(etapas, 'Convocatoria', ahora).label, 'menos de 48 h');
+    assert.equal(portal.etapaOperativa('Fecha Inicio de Puja'), 'Fecha Inicio de Puja');
+  });
+
+  it('lee lotes e ítems sin confundir los subtotales', () => {
+    const p = portal.parsearProductos(productos);
+    assert.deepEqual(p.lotes, [{numero: 1, cpc: '73390', descripcion: 'CONCESION DE LICENCIAS'}]);
+    assert.equal(p.items.length, 1);
+    assert.equal(p.items[0].subtotal, 139000);
+    assert.deepEqual(portal.cpcsDe(p), ['73390', '733900111']);
+  });
+
+  it('arma enlaces de descarga solo con tokens válidos y sin repetir', () => {
+    const fila = (nombre, token) => `<td><div align="left">${nombre}</div></td><td><div align="center"><a href='../PC/bajarArchivo.cpe?Archivo=${token}' onmouseover="x"><img></a></div></td>`;
+    const archivos = portal.parsearArchivos('<div align="left"><table><tr><th>Resolución</th></tr></table>' + fila('PLIEGO-PDF', 'abc_-1,') + fila('PLIEGO-PDF', 'abc_-1,') + fila('MALO', 'a"><script>'));
+    assert.equal(archivos.length, 1);
+    assert.equal(archivos[0].titulo, 'PLIEGO-PDF');
+    assert.match(archivos[0].url, /bajarArchivo\.cpe\?Archivo=abc_-1,$/);
+  });
+
+  it('solo acepta un proceso cuyo código coincide con el ocid', () => {
+    assert.ok(portal.codigoCoincide('ocds-5wno2w-SIE-ENT-2026-002-44359', 'SIE-ENT-2026-002'));
+    assert.ok(!portal.codigoCoincide('ocds-5wno2w-SIE-ENT-2026-002-44359', 'SIE-ENT-2026-00'));
+    assert.ok(!portal.codigoCoincide('ocds-5wno2w-SIE-ENT-2026-002-44359', 'RE-OTRA-2026-1'));
+    assert.ok(!portal.codigoCoincide('ocds-5wno2w-SIE-ENT-2026-002-44359', ''));
+  });
+
+  it('reconoce la página de bloqueo del portal', () => {
+    assert.ok(portal.esBloqueo('<title>Application Firewall Block Page</title>'));
+    assert.ok(!portal.esBloqueo(descripcion));
+  });
+
+  it('llena lo que falta del objetivo sin pisar lo que trae OCDS', () => {
+    const datos = {...portal.parsearDescripcion(descripcion), productos: portal.parsearProductos(productos)};
+    const soloPlan = portal.completarObjetivo('x', {ocid: 'x', titulo: 'Plan', texto: 'Plan XDR', entidad: '', modalidad: '', cpcs: [], referencial: null}, datos);
+    assert.equal(soloPlan.referencial, 139000);
+    assert.equal(soloPlan.titulo, 'Plan');
+    assert.deepEqual(soloPlan.cpcs, ['73390', '733900111']);
+    const completo = portal.completarObjetivo('x', {ocid: 'x', titulo: 'T', texto: 'T', entidad: 'E', modalidad: 'M', cpcs: ['51290'], referencial: 5}, datos);
+    assert.equal(completo.referencial, 5);
+    assert.deepEqual(completo.cpcs, ['51290']);
+    const sinRegistro = portal.completarObjetivo('x', null, datos);
+    assert.equal(sinRegistro.referencial, 139000);
+    assert.match(sinRegistro.texto, /XDR/);
+  });
+});
+
 describe('Reporte de precios', () => {
   const precios = require('./precios');
   const registro = (overrides = {}) => ({

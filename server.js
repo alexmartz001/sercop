@@ -7,6 +7,7 @@ const path = require('node:path');
 const auth = require('./auth');
 const ocds = require('./ocds');
 const precios = require('./precios');
+const portal = require('./portal');
 const { createIntegrations } = require('./integrations');
 
 function resolveListenPort(){
@@ -248,6 +249,11 @@ function initDB(){
     created_at TEXT DEFAULT (datetime('now')))`);
   db.exec(`CREATE TABLE IF NOT EXISTS precio_comparables(
     ocid TEXT PRIMARY KEY,
+    datos TEXT NOT NULL,
+    synced_at TEXT NOT NULL)`);
+  db.exec(`CREATE TABLE IF NOT EXISTS portal_procesos(
+    ocid TEXT PRIMARY KEY,
+    id_portal TEXT NOT NULL,
     datos TEXT NOT NULL,
     synced_at TEXT NOT NULL)`);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_cronograma_ocid ON cronograma_etapas(ocid)`);
@@ -3352,8 +3358,19 @@ async function candidatosPrecios(terminos, anioFinal, presupuesto){
 }
 
 async function construirReportePrecios(ocid){
+  const vinculo = leerPortal(ocid);
   let objetivo = leerComparable(ocid);
-  if(!objetivo || Date.now() - Date.parse(objetivo.syncedAt) > PRECIOS_TTL_MS) objetivo = await descargarComparable(ocid);
+  if(!objetivo || Date.now() - Date.parse(objetivo.syncedAt) > PRECIOS_TTL_MS){
+    try{
+      objetivo = await descargarComparable(ocid);
+    }catch(error){
+      // Con datos del portal, un corte de la API no impide calcular.
+      if(!vinculo) throw error;
+      console.warn(`  [Precios] ${ocid}: ${error.message}; se usa lo guardado del portal`);
+    }
+  }
+  const usaPortal = !!vinculo && (!objetivo || objetivo.referencial == null || !objetivo.cpcs?.length);
+  if(vinculo) objetivo = portal.completarObjetivo(ocid, objetivo, vinculo.datos);
   const terminos = precios.terminosBusqueda(objetivo.texto, 2);
   const anioFinal = sercopCurrentYear();
   const periodo = `${anioFinal - PRECIOS_ANIOS + 1}–${anioFinal}`;
@@ -3389,7 +3406,7 @@ async function construirReportePrecios(ocid){
     periodo,
     aviso
   });
-  return {...reporte, terminos, url: sercopPublicUrl(ocid)};
+  return {...reporte, terminos, usaPortal, url: sercopPublicUrl(ocid)};
 }
 
 function reportePrecios(ocid){
@@ -3399,10 +3416,77 @@ function reportePrecios(ocid){
   return tarea;
 }
 
+// -- Portal SOCE -----------------------------------------------------
+// Se consulta solo cuando alguien vincula o actualiza un proceso, una petición
+// a la vez. Si el firewall del portal bloquea, se espera en vez de insistir.
+const PORTAL_PAUSA_MS = 1500;
+const PORTAL_ESPERA_BLOQUEO_MS = 30 * 60 * 1000;
+let portalBloqueadoHasta = 0;
+let colaPortal = Promise.resolve();
+
+function errorPortal(codigo, mensaje){
+  return Object.assign(new Error(mensaje), {codigoPortal: codigo});
+}
+
+function leerPortal(ocid){
+  const row = dbGet("SELECT id_portal, datos, synced_at FROM portal_procesos WHERE ocid=?", [ocid]);
+  if(!row) return null;
+  try { return {id: row.id_portal, datos: JSON.parse(row.datos), syncedAt: row.synced_at}; } catch(_){ return null; }
+}
+
+async function pestanaPortal(id, pestana){
+  if(Date.now() < portalBloqueadoHasta) throw errorPortal('bloqueo', 'el portal bloqueó la consulta hace poco');
+  const resp = await fetch(portal.urlPestana(id, pestana), {
+    headers: {'User-Agent': 'NVG-Radar/11'},
+    signal: AbortSignal.timeout(20000)
+  });
+  const html = await resp.text();
+  if(portal.esBloqueo(html)){
+    portalBloqueadoHasta = Date.now() + PORTAL_ESPERA_BLOQUEO_MS;
+    throw errorPortal('bloqueo', 'el firewall del portal bloqueó la consulta');
+  }
+  if(!resp.ok) throw errorPortal('caido', `el portal respondió HTTP ${resp.status}`);
+  return html;
+}
+
+async function descargarPortal(id){
+  const descripcion = portal.parsearDescripcion(await pestanaPortal(id, portal.PESTANAS.descripcion));
+  if(!descripcion.codigo) throw errorPortal('no_existe', 'el portal no tiene ese proceso');
+  const siguiente = async pestana => {
+    await sleep(PORTAL_PAUSA_MS);
+    return pestanaPortal(id, pestana);
+  };
+  const fechas = portal.parsearFechas(await siguiente(portal.PESTANAS.fechas));
+  const productos = portal.parsearProductos(await siguiente(portal.PESTANAS.productos));
+  const archivos = portal.parsearArchivos(await siguiente(portal.PESTANAS.archivos));
+  return {...descripcion, fechas, productos, archivos};
+}
+
+function vincularPortal(ocid, id){
+  const tarea = colaPortal.then(async () => {
+    const datos = await descargarPortal(id);
+    if(!portal.codigoCoincide(ocid, datos.codigo)) throw errorPortal('otro_proceso', `el enlace es de ${datos.codigo}`);
+    dbRun("INSERT OR REPLACE INTO portal_procesos(ocid, id_portal, datos, synced_at) VALUES(?,?,?,?)",
+      [ocid, id, JSON.stringify(datos), new Date().toISOString()]);
+  });
+  colaPortal = tarea.catch(() => {});
+  return tarea;
+}
+
 function getFicha(ocid){
   const row = getProcessRow(ocid);
   if(!row) return null;
-  const etapas = dbAll("SELECT etapa_nombre, fecha_limite, completada FROM cronograma_etapas WHERE ocid=? ORDER BY fecha_limite", [ocid]);
+  const vinculo = leerPortal(ocid);
+  const delPortal = vinculo?.datos;
+  let etapas = dbAll("SELECT etapa_nombre, fecha_limite, completada FROM cronograma_etapas WHERE ocid=? ORDER BY fecha_limite", [ocid]);
+  if(!etapas.length && delPortal?.fechas?.length){
+    etapas = delPortal.fechas.map(item => ({
+      etapa_nombre: portal.etapaOperativa(item.etapa),
+      nombreVisible: item.etapa,
+      fecha_limite: item.fecha,
+      completada: Date.parse(item.fecha) < Date.now() ? 1 : 0
+    }));
+  }
   const participantes = dbAll("SELECT proveedor_ruc, proveedor_nombre, estado_oferta, monto_oferta FROM participantes_proceso WHERE ocid=? ORDER BY id", [ocid]);
   const cambios = dbAll("SELECT campo, valor_anterior, valor_nuevo, created_at FROM proceso_cambios WHERE ocid=? ORDER BY id DESC LIMIT 100", [ocid])
     .map(row => ({...row, created_at: sqliteUtcIso(row.created_at)}));
@@ -3413,6 +3497,9 @@ function getFicha(ocid){
     url: doc.url,
     formato: doc.format || ''
   })) : [];
+  for(const archivo of delPortal?.archivos || []){
+    if(!documentos.some(doc => doc.url === archivo.url)) documentos.push({titulo: archivo.titulo, url: archivo.url, formato: ''});
+  }
   const now = Date.now();
   const estado = row.synced_at ? ocds.stageFromStored(row, etapas, now) : null;
   const semaforo = estado ? ocds.semaphore(etapas.map(item => ({...item, completada: !!item.completada})), estado, now) : null;
@@ -3421,16 +3508,27 @@ function getFicha(ocid){
     codigo: row.codigo_proceso || procCodeTail(row.ocid),
     objeto: readableProcessTitle(row.title, row.description, row.ocid),
     descripcion: row.description || '',
-    entidad: row.buyer_name || '',
+    entidad: row.buyer_name || delPortal?.entidad || '',
     entidadRuc: row.entidad_ruc || '',
-    tipo: row.modalidad || '',
-    presupuesto: row.presupuesto,
+    tipo: row.modalidad || delPortal?.modalidad || '',
+    presupuesto: row.presupuesto ?? delPortal?.presupuesto ?? null,
     partida: detail?.partida || '',
     estado,
     semaforo,
+    portal: vinculo ? {
+      url: portal.urlFicha(vinculo.id),
+      syncedAt: vinculo.syncedAt,
+      idPortal: vinculo.id,
+      estado: delPortal.estado || '',
+      tipoCompra: delPortal.tipoCompra || '',
+      formaPago: delPortal.formaPago || '',
+      plazoEntrega: delPortal.plazoEntrega || '',
+      vigenciaOferta: delPortal.vigenciaOferta || '',
+      productos: delPortal.productos || {lotes: [], items: []}
+    } : null,
     url: row.url_portal || (String(row.source || 'SERCOP').toUpperCase() === 'SERCOP' ? sercopPublicUrl(row.ocid) : ''),
     syncedAt: row.synced_at,
-    cronograma: etapas.map(item => ({etapa: item.etapa_nombre, fechaLimite: item.fecha_limite, completada: !!item.completada})),
+    cronograma: etapas.map(item => ({etapa: item.nombreVisible || item.etapa_nombre, fechaLimite: item.fecha_limite, completada: !!item.completada})),
     participantes,
     documentos,
     cambios
@@ -3762,6 +3860,26 @@ const server = http.createServer(async (req, res) => {
       const ficha = getFicha(decodeURIComponent(fichaMatch[1]));
       if(!ficha) return json(res, 404, {error:'proceso no encontrado'});
       return json(res, 200, ficha);
+    }
+    const portalMatch = pathname.match(/^\/api\/procesos\/(.+)\/portal$/);
+    if(portalMatch && req.method === 'POST'){
+      const ocid = decodeURIComponent(portalMatch[1]);
+      if(!/^ocds-[A-Za-z0-9-]+$/.test(ocid)) return json(res, 400, {error:'ocid no válido'});
+      if(!getProcessRow(ocid)) return json(res, 404, {error:'proceso no encontrado'});
+      let body;
+      try{ body = JSON.parse((await collectBody(req)).toString('utf8') || '{}'); }
+      catch(e){ return json(res, 400, {error:'cuerpo inválido'}); }
+      const id = body.referencia ? portal.idDesdeTexto(body.referencia) : leerPortal(ocid)?.id;
+      if(!id) return json(res, 400, {error:'enlace del portal no válido'});
+      try{
+        await vincularPortal(ocid, id);
+        return json(res, 200, getFicha(ocid));
+      }catch(error){
+        console.warn(`  [Portal] ${ocid}: ${error.message}`);
+        if(error.codigoPortal === 'no_existe') return json(res, 404, {error:'el portal no tiene ese proceso'});
+        if(error.codigoPortal === 'otro_proceso') return json(res, 409, {error:error.message});
+        return json(res, 502, {error:'el portal no respondió'});
+      }
     }
     const preciosMatch = pathname.match(/^\/api\/procesos\/(.+)\/precios$/);
     if(preciosMatch && req.method === 'GET'){
