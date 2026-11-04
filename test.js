@@ -1797,6 +1797,45 @@ describe('Reporte de precios', () => {
     });
   });
 
+  describe('muestra en segundo plano', () => {
+    const ahora = Date.parse('2026-11-04T12:00:00Z');
+    const dias = n => new Date(ahora - n * 24 * 60 * 60 * 1000).toISOString();
+
+    it('compara por clase de CPC y deja fuera lo que no corresponde', () => {
+      const obj = {cpcs: ['733900111']};
+      assert.ok(precios.coincideConObjetivo(obj, ['xdr'], {cpcs: ['733901234'], fecha: '2025-01-01'}, 2024));
+      assert.ok(!precios.coincideConObjetivo(obj, ['xdr'], {cpcs: ['512900011'], titulo: 'xdr', fecha: '2025-01-01'}, 2024));
+      assert.ok(!precios.coincideConObjetivo(obj, [], {cpcs: ['733900111'], fecha: '2021-06-01'}, 2024));
+    });
+
+    it('sin CPC compara por palabras, sin importar tildes ni mayúsculas', () => {
+      assert.ok(precios.coincideConObjetivo({cpcs: []}, ['suscripcion'], {titulo: 'SUSCRIPCIÓN ANUAL', fecha: '2025-01-01'}, 2024));
+      assert.ok(!precios.coincideConObjetivo({cpcs: []}, ['suscripcion'], {titulo: 'Compra de sillas', fecha: '2025-01-01'}, 2024));
+    });
+
+    it('usa menos cupo en horario laboral de Ecuador', () => {
+      assert.equal(precios.presupuestoMuestra(Date.parse('2026-11-04T15:00:00Z')), 2); // 10:00 en Ecuador
+      assert.equal(precios.presupuestoMuestra(Date.parse('2026-11-05T04:00:00Z')), 8); // 23:00 en Ecuador
+    });
+
+    it('espera cada vez más tras un corte, hasta un tope', () => {
+      assert.equal(precios.siguienteEspera(0), 60 * 60 * 1000);
+      assert.equal(precios.siguienteEspera(60 * 60 * 1000), 2 * 60 * 60 * 1000);
+      assert.equal(precios.siguienteEspera(6 * 60 * 60 * 1000), 6 * 60 * 60 * 1000);
+    });
+
+    it('elige la búsqueda que falta, sigue las páginas y repite solo lo vencido', () => {
+      const elegir = hechas => precios.siguienteBusqueda(['xdr'], new Map(hechas), 2026, 2, ahora);
+      assert.deepEqual(elegir([]), {termino: 'xdr', anio: 2026, pagina: 1});
+      const hecha = (siguiente, paginas, cuando) => ({pagina_siguiente: siguiente, paginas, buscado_at: cuando});
+      assert.deepEqual(elegir([['xdr|2026', hecha(2, 5, dias(0))]]), {termino: 'xdr', anio: 2026, pagina: 2});
+      assert.deepEqual(elegir([['xdr|2026', hecha(4, 5, dias(0))]]), {termino: 'xdr', anio: 2025, pagina: 1});
+      const completo = [['xdr|2026', hecha(2, 1, dias(1))], ['xdr|2025', hecha(2, 1, dias(20))]];
+      assert.equal(elegir(completo), null);
+      assert.deepEqual(elegir([['xdr|2026', hecha(2, 1, dias(8))], ['xdr|2025', hecha(2, 1, dias(20))]]), {termino: 'xdr', anio: 2026, pagina: 1});
+    });
+  });
+
   it('extrae términos sin confundir mayúsculas con siglas', () => {
     assert.equal(precios.terminosBusqueda('Plataforma para detección de amenazas (XDR) en el SERCOP')[0], 'xdr');
     assert.ok(!precios.terminosBusqueda('Plataforma para detección de amenazas (XDR) en el SERCOP').includes('sercop'));

@@ -260,7 +260,7 @@ Respuesta:
 |---------|-----|
 | `server.js` | Servidor HTTP, rutas, auth, monitor, planificador. |
 | `auth.js` | scrypt, sesiones, CSRF y limitador **persistente** (SQLite). |
-| `precios.js` | Reporte de precios: rebaja adjudicada de procesos comparables, calculada con registros OCDS oficiales. |
+| `precios.js` | Reporte de precios: rebaja adjudicada de procesos comparables, calculada con registros OCDS oficiales. El reporte lee la base local; un proceso de fondo la llena con cupo limitado (`NVG_PRECIOS_WORKER_MIN`, 0 lo apaga). |
 | `portal.js` | Lee las pestañas públicas de un proceso del portal SOCE a partir del enlace que pega el usuario; no automatiza la búsqueda, que tiene captcha. |
 | `integrations.js` | Webhook (HMAC) + Telegram (Bot API) + Microsoft Graph (correo/calendario) + SMTP. |
 | `sercop.html` | Panel (acciones delegadas por `data-act`, sin handlers inline). |

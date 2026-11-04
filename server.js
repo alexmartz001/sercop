@@ -251,6 +251,23 @@ function initDB(){
     ocid TEXT PRIMARY KEY,
     datos TEXT NOT NULL,
     synced_at TEXT NOT NULL)`);
+  db.exec(`CREATE TABLE IF NOT EXISTS precio_terminos(
+    termino TEXT PRIMARY KEY,
+    prioridad INTEGER NOT NULL DEFAULT 0,
+    creado_at TEXT NOT NULL)`);
+  db.exec(`CREATE TABLE IF NOT EXISTS precio_busquedas(
+    termino TEXT NOT NULL,
+    anio INTEGER NOT NULL,
+    pagina_siguiente INTEGER NOT NULL,
+    paginas INTEGER NOT NULL,
+    buscado_at TEXT NOT NULL,
+    PRIMARY KEY(termino, anio))`);
+  db.exec(`CREATE TABLE IF NOT EXISTS precio_cola(
+    ocid TEXT PRIMARY KEY,
+    termino TEXT NOT NULL,
+    prioridad INTEGER NOT NULL DEFAULT 0,
+    intentos INTEGER NOT NULL DEFAULT 0,
+    agregado_at TEXT NOT NULL)`);
   db.exec(`CREATE TABLE IF NOT EXISTS portal_procesos(
     ocid TEXT PRIMARY KEY,
     id_portal TEXT NOT NULL,
@@ -3301,13 +3318,25 @@ function getTablero(){
 
 // -- Reporte de precios ----------------------------------------------
 // La API oficial no busca por CPC: se buscan palabras del objeto, se leen los
-// registros y el CPC se compara aquí. Cada llamada lee pocos registros nuevos y
-// guarda el resumen, de modo que la muestra crece sin agotar el cupo del portal.
+// registros y el CPC se compara aquí. Esa lectura va en segundo plano, con cupo
+// limitado, porque el portal corta tras pocas consultas; el reporte solo lee lo
+// guardado en la base y por eso responde al instante.
 const PRECIOS_ANIOS = 3;
-const PRECIOS_LOTE = 8;
-const PRECIOS_PAUSA_MS = 3000; // El portal corta tras unas 10 consultas seguidas a 1,2 s.
 const PRECIOS_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+const MUESTRA_PAUSA_MS = Math.max(0, Number(process.env.NVG_PRECIOS_PAUSA_MS ?? 10000) || 0);
+const MUESTRA_INTERVALO_MS = Math.max(0, Number(process.env.NVG_PRECIOS_WORKER_MIN ?? 10) || 0) * 60 * 1000; // 0 lo apaga.
+const MUESTRA_ACTIVOS_CADA_MS = 6 * 60 * 60 * 1000;
+const MUESTRA_MAX_ACTIVOS = 200;
+const MUESTRA_MAX_INTENTOS = 3;
 const preciosEnCurso = new Map();
+let muestraCorriendo = false;
+let muestraTimer = null;
+let muestraUltimoTick = 0;
+let muestraActivosAt = 0;
+let muestraPausadaHasta = 0;
+let muestraEsperaMs = 0;
+let muestraPausaEsLimite = false;
+const MUESTRA_ESPERA_CONEXION_MS = 5 * 60 * 1000;
 
 function leerComparable(ocid){
   const row = dbGet("SELECT datos, synced_at FROM precio_comparables WHERE ocid=?", [ocid]);
@@ -3327,34 +3356,143 @@ async function descargarComparable(ocid){
   return comparable;
 }
 
-async function candidatosPrecios(terminos, anioFinal, presupuesto){
-  const filas = new Map();
-  const cercania = monto => presupuesto > 0 ? Math.abs(monto - presupuesto) : 0;
-  const ordenar = () => [...filas.entries()].sort((a, b) => cercania(a[1]) - cercania(b[1])).map(([ocid]) => ocid);
-  for(let anio = anioFinal; anio > anioFinal - PRECIOS_ANIOS; anio--){
-    for(const termino of terminos){
-      const query = sercopQuery(termino, anio, '', '');
-      if(query.shortSearch || query.badYear) continue;
-      const params = new URLSearchParams({year: query.year, search: query.search, page: 1});
-      const url = `${SERCOP_API}/search_ocds?${params.toString()}`;
-      const enCache = !!getCached(url, SEARCH_CACHE_MS);
-      let data;
-      try{
-        data = await fetchCached(url, {retries: 0, staleOnError: true}, false, SEARCH_CACHE_MS);
-      }catch(error){
-        // Un corte del portal no descarta lo que ya respondió.
-        console.warn(`  [Precios] búsqueda ${termino} ${anio}: ${error.message}`);
-        return {ocids: ordenar(), parcial: true};
+function esCorteSercop(error){
+  return error?.code === 'SERCOP_PAUSE' || isConnectFailure(error) || /429/.test(error?.message || '');
+}
+
+function registrarTerminos(terminos, prioridad){
+  const ahora = new Date().toISOString();
+  for(const termino of terminos){
+    dbRun(`INSERT INTO precio_terminos(termino, prioridad, creado_at) VALUES(?,?,?)
+      ON CONFLICT(termino) DO UPDATE SET prioridad=MAX(prioridad, excluded.prioridad)`, [termino, prioridad, ahora]);
+  }
+}
+
+// Sin nadie pidiendo reportes, la muestra crece con lo que está en el tablero.
+function registrarProcesosActivos(){
+  const filas = dbAll(`SELECT title, description FROM procesos
+    WHERE UPPER(COALESCE(source,'SERCOP'))='SERCOP' AND synced_at IS NOT NULL ORDER BY date DESC LIMIT ?`, [MUESTRA_MAX_ACTIVOS]);
+  for(const fila of filas) registrarTerminos(precios.terminosBusqueda(`${fila.title || ''} ${fila.description || ''}`, 2), 0);
+}
+
+function proximaBusquedaMuestra(){
+  const terminos = dbAll("SELECT termino FROM precio_terminos ORDER BY prioridad DESC, creado_at").map(fila => fila.termino);
+  const hechas = new Map(dbAll("SELECT * FROM precio_busquedas").map(fila => [`${fila.termino}|${fila.anio}`, fila]));
+  return precios.siguienteBusqueda(terminos, hechas, sercopCurrentYear(), PRECIOS_ANIOS, Date.now());
+}
+
+function necesitaLectura(ocid){
+  const guardado = leerComparable(ocid);
+  if(!guardado) return true;
+  return !precios.esUtil(guardado) && Date.now() - Date.parse(guardado.syncedAt) > PRECIOS_TTL_MS;
+}
+
+async function ejecutarBusquedaMuestra({termino, anio, pagina}){
+  const fila = dbGet("SELECT prioridad FROM precio_terminos WHERE termino=?", [termino]);
+  const query = sercopQuery(termino, anio, '', '');
+  const ahora = new Date().toISOString();
+  let paginas = 1;
+  let siguiente = 2;
+  if(!query.shortSearch && !query.badYear){
+    const params = new URLSearchParams({year: query.year, search: query.search, page: pagina});
+    const data = await fetchCached(`${SERCOP_API}/search_ocds?${params.toString()}`, {retries: 0}, false, SEARCH_CACHE_MS);
+    paginas = Number(data?.pages || data?.total_pages || 1) || 1;
+    siguiente = pagina + 1;
+    for(const row of Array.isArray(data?.data) ? data.data : []){
+      // Sin monto todavía no hay adjudicación que comparar.
+      if(row?.ocid && Number(row?.amount) > 0 && necesitaLectura(row.ocid)){
+        dbRun(`INSERT INTO precio_cola(ocid, termino, prioridad, agregado_at) VALUES(?,?,?,?)
+          ON CONFLICT(ocid) DO UPDATE SET prioridad=MAX(prioridad, excluded.prioridad)`, [row.ocid, termino, fila?.prioridad || 0, ahora]);
       }
-      for(const row of Array.isArray(data?.data) ? data.data : []){
-        // Sin monto todavía no hay adjudicación que comparar.
-        const monto = Number(row?.amount);
-        if(row?.ocid && monto > 0 && !filas.has(row.ocid)) filas.set(row.ocid, monto);
-      }
-      if(!enCache) await sleep(PRECIOS_PAUSA_MS);
     }
   }
-  return {ocids: ordenar(), parcial: false};
+  dbRun("INSERT OR REPLACE INTO precio_busquedas(termino, anio, pagina_siguiente, paginas, buscado_at) VALUES(?,?,?,?,?)",
+    [termino, anio, siguiente, paginas, ahora]);
+}
+
+async function leerDeColaMuestra(fila){
+  try{
+    await descargarComparable(fila.ocid);
+    dbRun("DELETE FROM precio_cola WHERE ocid=?", [fila.ocid]);
+  }catch(error){
+    if(esCorteSercop(error)) throw error;
+    console.warn(`  [Muestra] ${fila.ocid}: ${error.message}`);
+    if(fila.intentos + 1 >= MUESTRA_MAX_INTENTOS) dbRun("DELETE FROM precio_cola WHERE ocid=?", [fila.ocid]);
+    else dbRun("UPDATE precio_cola SET intentos=intentos+1 WHERE ocid=?", [fila.ocid]);
+  }
+}
+
+// Cada turno hace una búsqueda, si hay, y dedica el resto del cupo a leer la cola.
+async function turnoMuestra(){
+  if(muestraCorriendo || !db || syncRunning || sercopPaused() || Date.now() < muestraPausadaHasta) return;
+  muestraCorriendo = true;
+  muestraUltimoTick = Date.now();
+  let leidos = 0;
+  try{
+    if(Date.now() - muestraActivosAt > MUESTRA_ACTIVOS_CADA_MS){
+      registrarProcesosActivos();
+      muestraActivosAt = Date.now();
+    }
+    let cupo = precios.presupuestoMuestra(Date.now());
+    let buscoEnEsteTurno = false;
+    while(cupo > 0 && !sercopPaused()){
+      const busqueda = buscoEnEsteTurno ? null : proximaBusquedaMuestra();
+      const enCola = busqueda ? null : dbGet("SELECT ocid, intentos FROM precio_cola ORDER BY prioridad DESC, agregado_at LIMIT 1");
+      if(busqueda){
+        await ejecutarBusquedaMuestra(busqueda);
+        buscoEnEsteTurno = true;
+      }else if(enCola){
+        await leerDeColaMuestra(enCola);
+        leidos++;
+      }else if(buscoEnEsteTurno){
+        buscoEnEsteTurno = false; // Cola vacía: se puede seguir buscando.
+        continue;
+      }else{
+        break;
+      }
+      cupo--;
+      if(cupo > 0) await sleep(MUESTRA_PAUSA_MS);
+    }
+    muestraEsperaMs = 0;
+  }catch(error){
+    if(!esCorteSercop(error)) throw error;
+    // Solo el 429 es un límite y alarga la espera; un portal lento se reintenta pronto.
+    muestraPausaEsLimite = /429/.test(error.message || '');
+    if(muestraPausaEsLimite) muestraEsperaMs = precios.siguienteEspera(muestraEsperaMs);
+    const espera = muestraPausaEsLimite ? muestraEsperaMs : MUESTRA_ESPERA_CONEXION_MS;
+    muestraPausadaHasta = Date.now() + espera;
+    console.warn(`  [Muestra] ${muestraPausaEsLimite ? 'SERCOP limitó las consultas' : 'SERCOP no respondió'} (${error.message}); se retoma en ${Math.round(espera / 60000)} min`);
+  }finally{
+    muestraCorriendo = false;
+    if(leidos) console.log(`  [Muestra] ${leidos} procesos leídos en este turno`);
+  }
+}
+
+function lanzarTurnoMuestra(){
+  turnoMuestra().catch(error => console.error('[Muestra] Error:', error.message));
+}
+
+function startMuestra(){
+  if(muestraTimer || !MUESTRA_INTERVALO_MS) return;
+  muestraTimer = setInterval(lanzarTurnoMuestra, MUESTRA_INTERVALO_MS);
+  console.log(`  Muestra de precios en segundo plano (cada ${MUESTRA_INTERVALO_MS / 60000} min)`);
+}
+
+function comparablesLocales(objetivo, terminos, anioInicio){
+  const candidatos = [];
+  for(const fila of dbAll("SELECT datos FROM precio_comparables WHERE ocid<>?", [objetivo.ocid])){
+    let comparable;
+    try { comparable = JSON.parse(fila.datos); } catch(_){ continue; }
+    if(precios.coincideConObjetivo(objetivo, terminos, comparable, anioInicio)) candidatos.push(comparable);
+  }
+  return candidatos;
+}
+
+function objetivoDesdeProceso(ocid){
+  const fila = getProcessRow(ocid);
+  if(!fila) return null;
+  const titulo = String(fila.title || fila.description || '').slice(0, 300);
+  return {ocid, titulo, texto: `${fila.title || ''} ${fila.description || ''}`.trim(), entidad: fila.buyer_name || '', modalidad: fila.modalidad || '', cpcs: [], referencial: fila.presupuesto ?? null};
 }
 
 async function construirReportePrecios(ocid){
@@ -3364,48 +3502,37 @@ async function construirReportePrecios(ocid){
     try{
       objetivo = await descargarComparable(ocid);
     }catch(error){
-      // Con datos del portal, un corte de la API no impide calcular.
-      if(!vinculo) throw error;
-      console.warn(`  [Precios] ${ocid}: ${error.message}; se usa lo guardado del portal`);
+      // Un corte de la API no impide calcular con lo que ya se conoce del proceso.
+      objetivo = objetivo || objetivoDesdeProceso(ocid);
+      if(!objetivo && !vinculo) throw error;
+      console.warn(`  [Precios] ${ocid}: ${error.message}; se calcula con lo guardado`);
     }
   }
   const usaPortal = !!vinculo && (!objetivo || objetivo.referencial == null || !objetivo.cpcs?.length);
   if(vinculo) objetivo = portal.completarObjetivo(ocid, objetivo, vinculo.datos);
-  const terminos = precios.terminosBusqueda(objetivo.texto, 2);
+  const lotes = (vinculo?.datos?.productos?.lotes || []).map(lote => lote.descripcion).join(' ');
+  const terminos = [...new Set([...precios.terminosBusqueda(objetivo.texto, 2), ...precios.terminosBusqueda(lotes, 1)])];
+  // Quien pide el reporte pasa adelante en la cola.
+  registrarTerminos(terminos, 1);
+  dbRun(`UPDATE precio_cola SET prioridad=1 WHERE termino IN (${terminos.map(() => '?').join(',') || "''"})`, terminos);
   const anioFinal = sercopCurrentYear();
-  const periodo = `${anioFinal - PRECIOS_ANIOS + 1}–${anioFinal}`;
-  let aviso = '';
-  const {ocids, parcial} = await candidatosPrecios(terminos, anioFinal, objetivo.referencial);
-  if(parcial) aviso = 'SERCOP limitó las consultas; la búsqueda quedó incompleta. Intenta de nuevo en unos minutos.';
-  const conocidos = new Map();
-  const nuevos = [];
-  for(const candidato of ocids){
-    if(candidato === ocid) continue;
-    const guardado = leerComparable(candidato);
-    const vencido = guardado && !precios.esUtil(guardado) && Date.now() - Date.parse(guardado.syncedAt) > PRECIOS_TTL_MS;
-    if(guardado && !vencido) conocidos.set(candidato, guardado);
-    else nuevos.push(candidato);
-  }
-  let leidos = 0;
-  for(const candidato of nuevos.slice(0, PRECIOS_LOTE)){
-    if(sercopPaused()){ aviso = 'El portal de SERCOP está en pausa; el reporte quedó parcial.'; break; }
-    try{
-      conocidos.set(candidato, await descargarComparable(candidato));
-      leidos++;
-      await sleep(PRECIOS_PAUSA_MS);
-    }catch(error){
-      console.warn(`  [Precios] ${candidato}: ${error.message}`);
-      if(error.code === 'SERCOP_PAUSE' || isConnectFailure(error) || /429/.test(error.message || '')){
-        aviso = 'SERCOP limitó las consultas; el reporte quedó parcial.';
-        break;
-      }
-    }
-  }
-  const reporte = precios.construirReporte(objetivo, [...conocidos.values()], {
-    pendientes: nuevos.length - leidos,
-    periodo,
-    aviso
+  const anioInicio = anioFinal - PRECIOS_ANIOS + 1;
+  const hechas = dbAll("SELECT termino, anio, pagina_siguiente, paginas FROM precio_busquedas");
+  const busquedasPendientes = terminos.length * PRECIOS_ANIOS - hechas.filter(fila => terminos.includes(fila.termino) && fila.anio >= anioInicio).length;
+  const pendientes = terminos.length
+    ? dbGet(`SELECT COUNT(*) AS n FROM precio_cola WHERE termino IN (${terminos.map(() => '?').join(',')})`, terminos).n
+    : 0;
+  const pausado = Date.now() < muestraPausadaHasta;
+  const reporte = precios.construirReporte(objetivo, comparablesLocales(objetivo, terminos, anioInicio), {
+    pendientes,
+    busquedasPendientes,
+    periodo: `${anioInicio}–${anioFinal}`,
+    aviso: !pausado ? '' : muestraPausaEsLimite
+      ? 'SERCOP limitó las consultas; la muestra se retomará sola más tarde.'
+      : 'SERCOP no responde por ahora; la muestra se retomará sola en unos minutos.'
   });
+  // Un clic adelanta el turno, sin saturar el portal si se repite.
+  if(muestraTimer && Date.now() - muestraUltimoTick > 2 * 60 * 1000) setImmediate(lanzarTurnoMuestra);
   return {...reporte, terminos, usaPortal, url: sercopPublicUrl(ocid)};
 }
 
@@ -4288,6 +4415,7 @@ function boot(){
     else console.log(`  Acceso: expuesto en ${HOST} — asegúrate de estar detrás del proxy con TLS.`);
     console.log('');
     startMonitor();
+    startMuestra();
   }).catch(e => {
     try{ if(db) db.close(); }catch(_){}
     db = null;

@@ -1823,7 +1823,7 @@ async function vincularPortalFicha(ocid, conEnlace){
 async function loadPrecios(ocid){
   const box = $('preciosBox');
   if(!box || !ocid) return;
-  box.innerHTML = '<div class="note">Leyendo adjudicaciones parecidas en SERCOP. Puede tardar hasta un minuto y medio…</div>';
+  box.innerHTML = '<div class="note">Calculando con las adjudicaciones guardadas…</div>';
   try{
     box.innerHTML = preciosHtml(await api('/api/procesos/' + encodeURIComponent(ocid) + '/precios'));
   }catch(e){
@@ -1834,10 +1834,11 @@ function preciosHtml(r){
   const dinero = v => v != null ? esc(fmtMoney(v, 'USD')) : '—';
   const pct = v => v != null ? esc(String(v).replace('.', ',')) + ' %' : '—';
   const c = r.cobertura || {};
-  const ampliar = c.pendientes > 0 ? `<button class="btn btn-ghost btn-sm" style="margin-top:8px;" data-act="load-precios" data-ocid="${esc(r.ocid)}">Leer ${esc(String(c.pendientes))} procesos más</button>` : '';
+  const porLeer = (c.pendientes || 0) + (c.busquedasPendientes || 0);
+  const ampliar = porLeer > 0 ? `<div class="note">La muestra sigue creciendo en segundo plano: quedan ${esc(String(c.pendientes || 0))} ${c.pendientes === 1 ? 'proceso' : 'procesos'} por leer y ${esc(String(c.busquedasPendientes || 0))} ${c.busquedasPendientes === 1 ? 'búsqueda' : 'búsquedas'}. Puede tomar horas por el límite de SERCOP.</div><button class="btn btn-ghost btn-sm" style="margin-top:8px;" data-act="load-precios" data-ocid="${esc(r.ocid)}">Actualizar reporte</button>` : '';
   const aviso = c.aviso ? `<div class="note"><b>${esc(c.aviso)}</b></div>` : '';
   if(!r.muestra){
-    return `<div class="empty" style="display:block;">Todavía no hay adjudicaciones comparables entre ${esc(String(c.analizados || 0))} ${c.analizados === 1 ? 'proceso leído' : 'procesos leídos'}.</div>${aviso}${ampliar}`;
+    return `<div class="empty" style="display:block;">Todavía no hay adjudicaciones comparables entre ${esc(String(c.analizados || 0))} ${c.analizados === 1 ? 'proceso guardado' : 'procesos guardados'}.</div>${aviso}${ampliar}`;
   }
   const debil = !r.suficiente || r.criterio.nivel === 'texto';
   const similares = (r.similares || []).map(s => `<tr><td>${esc(s.titulo || s.ocid)}<div class="kmeta">${esc(s.entidad)}</div></td><td>${dinero(s.referencial)}</td><td>${dinero(s.adjudicado)}</td><td>${pct(s.bajaPct)}</td><td>${s.oferentes != null ? esc(String(s.oferentes)) : '—'}</td></tr>`).join('');

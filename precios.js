@@ -160,6 +160,47 @@ function terminosBusqueda(texto, limite = 3){
   return [...new Set([...siglasUtiles, ...palabras])].slice(0, limite);
 }
 
+// La muestra guardada es de todos los procesos: esto deja solo los que pueden
+// compararse con el objetivo, dentro del periodo. Con CPC manda la clase de 5
+// dígitos; sin CPC, alguna de las palabras buscadas.
+function coincideConObjetivo(objetivo, terminos, comparable, anioInicio){
+  const fecha = Date.parse(comparable?.fecha || '');
+  if(Number.isFinite(fecha) && new Date(fecha).getUTCFullYear() < anioInicio) return false;
+  const clases = new Set((objetivo.cpcs || []).map(clave => clave.slice(0, 5)));
+  if(clases.size) return (comparable.cpcs || []).some(clave => clases.has(clave.slice(0, 5)));
+  const texto = normalizar(`${comparable.titulo || ''} ${comparable.texto || ''}`);
+  return (terminos || []).some(termino => texto.includes(normalizar(termino)));
+}
+
+// De noche en Ecuador (UTC-5) el portal tiene menos uso; de día se deja cupo a los radares.
+function presupuestoMuestra(ahoraMs, deDia = 2, deNoche = 8){
+  const hora = (new Date(ahoraMs).getUTCHours() + 19) % 24;
+  return (hora >= 20 || hora < 6) ? deNoche : deDia;
+}
+
+// Tras un corte se espera cada vez más, hasta un tope.
+function siguienteEspera(esperaMs, minimoMs = 60 * 60 * 1000, maximoMs = 6 * 60 * 60 * 1000){
+  return esperaMs > 0 ? Math.min(esperaMs * 2, maximoMs) : minimoMs;
+}
+
+// Elige la próxima búsqueda: primero los términos con más prioridad, del año más
+// reciente al más antiguo, y solo repite lo ya buscado cuando venció.
+function siguienteBusqueda(terminos, hechas, anioFinal, anios, ahoraMs, opciones = {}){
+  const maxPaginas = opciones.maxPaginas || 3;
+  const vigenciaActualMs = opciones.vigenciaActualMs || 7 * 24 * 60 * 60 * 1000;
+  const vigenciaPasadoMs = opciones.vigenciaPasadoMs || 30 * 24 * 60 * 60 * 1000;
+  for(const termino of terminos){
+    for(let anio = anioFinal; anio > anioFinal - anios; anio--){
+      const hecha = hechas.get(`${termino}|${anio}`);
+      if(!hecha) return {termino, anio, pagina: 1};
+      if(hecha.pagina_siguiente <= Math.min(hecha.paginas || 1, maxPaginas)) return {termino, anio, pagina: hecha.pagina_siguiente};
+      const vigencia = anio === anioFinal ? vigenciaActualMs : vigenciaPasadoMs;
+      if(ahoraMs - Date.parse(hecha.buscado_at) > vigencia) return {termino, anio, pagina: 1};
+    }
+  }
+  return null;
+}
+
 // Elige el criterio más estricto que deje una muestra suficiente. El texto queda
 // al final porque una coincidencia de palabras no garantiza el mismo producto.
 function seleccionarComparables(objetivo, candidatos){
@@ -241,6 +282,7 @@ function construirReporte(objetivo, candidatos, opciones = {}){
     cobertura: {
       analizados: candidatos.length,
       pendientes: opciones.pendientes || 0,
+      busquedasPendientes: opciones.busquedasPendientes || 0,
       periodo: opciones.periodo || '',
       aviso: opciones.aviso || ''
     }
@@ -254,6 +296,10 @@ module.exports = {
   comparableDeRegistro,
   esUtil,
   terminosBusqueda,
+  coincideConObjetivo,
+  presupuestoMuestra,
+  siguienteEspera,
+  siguienteBusqueda,
   seleccionarComparables,
   construirReporte
 };
