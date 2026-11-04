@@ -260,6 +260,7 @@ Respuesta:
 |---------|-----|
 | `server.js` | Servidor HTTP, rutas, auth, monitor, planificador. |
 | `auth.js` | scrypt, sesiones, CSRF y limitador **persistente** (SQLite). |
+| `precios.js` | Reporte de precios: rebaja adjudicada de procesos comparables, calculada con registros OCDS oficiales. |
 | `integrations.js` | Webhook (HMAC) + Telegram (Bot API) + Microsoft Graph (correo/calendario) + SMTP. |
 | `sercop.html` | Panel (acciones delegadas por `data-act`, sin handlers inline). |
 | `login.html` | Página de login. |

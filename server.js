@@ -6,6 +6,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const auth = require('./auth');
 const ocds = require('./ocds');
+const precios = require('./precios');
 const { createIntegrations } = require('./integrations');
 
 function resolveListenPort(){
@@ -245,6 +246,10 @@ function initDB(){
     valor_anterior TEXT,
     valor_nuevo TEXT,
     created_at TEXT DEFAULT (datetime('now')))`);
+  db.exec(`CREATE TABLE IF NOT EXISTS precio_comparables(
+    ocid TEXT PRIMARY KEY,
+    datos TEXT NOT NULL,
+    synced_at TEXT NOT NULL)`);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_cronograma_ocid ON cronograma_etapas(ocid)`);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_participantes_ocid ON participantes_proceso(ocid)`);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_cambios_ocid ON proceso_cambios(ocid)`);
@@ -3288,6 +3293,112 @@ function getTablero(){
   };
 }
 
+// -- Reporte de precios ----------------------------------------------
+// La API oficial no busca por CPC: se buscan palabras del objeto, se leen los
+// registros y el CPC se compara aquí. Cada llamada lee pocos registros nuevos y
+// guarda el resumen, de modo que la muestra crece sin agotar el cupo del portal.
+const PRECIOS_ANIOS = 3;
+const PRECIOS_LOTE = 8;
+const PRECIOS_PAUSA_MS = 3000; // El portal corta tras unas 10 consultas seguidas a 1,2 s.
+const PRECIOS_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+const preciosEnCurso = new Map();
+
+function leerComparable(ocid){
+  const row = dbGet("SELECT datos, synced_at FROM precio_comparables WHERE ocid=?", [ocid]);
+  if(!row) return null;
+  try { return {...JSON.parse(row.datos), syncedAt: row.synced_at}; } catch(_){ return null; }
+}
+
+function guardarComparable(comparable){
+  dbRun("INSERT OR REPLACE INTO precio_comparables(ocid, datos, synced_at) VALUES(?,?,?)",
+    [comparable.ocid, JSON.stringify(comparable), new Date().toISOString()]);
+}
+
+async function descargarComparable(ocid){
+  const resp = await fetchWithRetry(`${SERCOP_API}/record?ocid=${encodeURIComponent(ocid)}`, {headers:{'Accept':'application/json'}, retries: 0});
+  const comparable = precios.comparableDeRegistro(ocid, collectReleases(await resp.json()));
+  guardarComparable(comparable);
+  return comparable;
+}
+
+async function candidatosPrecios(terminos, anioFinal, presupuesto){
+  const filas = new Map();
+  const cercania = monto => presupuesto > 0 ? Math.abs(monto - presupuesto) : 0;
+  const ordenar = () => [...filas.entries()].sort((a, b) => cercania(a[1]) - cercania(b[1])).map(([ocid]) => ocid);
+  for(let anio = anioFinal; anio > anioFinal - PRECIOS_ANIOS; anio--){
+    for(const termino of terminos){
+      const query = sercopQuery(termino, anio, '', '');
+      if(query.shortSearch || query.badYear) continue;
+      const params = new URLSearchParams({year: query.year, search: query.search, page: 1});
+      const url = `${SERCOP_API}/search_ocds?${params.toString()}`;
+      const enCache = !!getCached(url, SEARCH_CACHE_MS);
+      let data;
+      try{
+        data = await fetchCached(url, {retries: 0, staleOnError: true}, false, SEARCH_CACHE_MS);
+      }catch(error){
+        // Un corte del portal no descarta lo que ya respondió.
+        console.warn(`  [Precios] búsqueda ${termino} ${anio}: ${error.message}`);
+        return {ocids: ordenar(), parcial: true};
+      }
+      for(const row of Array.isArray(data?.data) ? data.data : []){
+        // Sin monto todavía no hay adjudicación que comparar.
+        const monto = Number(row?.amount);
+        if(row?.ocid && monto > 0 && !filas.has(row.ocid)) filas.set(row.ocid, monto);
+      }
+      if(!enCache) await sleep(PRECIOS_PAUSA_MS);
+    }
+  }
+  return {ocids: ordenar(), parcial: false};
+}
+
+async function construirReportePrecios(ocid){
+  let objetivo = leerComparable(ocid);
+  if(!objetivo || Date.now() - Date.parse(objetivo.syncedAt) > PRECIOS_TTL_MS) objetivo = await descargarComparable(ocid);
+  const terminos = precios.terminosBusqueda(objetivo.texto, 2);
+  const anioFinal = sercopCurrentYear();
+  const periodo = `${anioFinal - PRECIOS_ANIOS + 1}–${anioFinal}`;
+  let aviso = '';
+  const {ocids, parcial} = await candidatosPrecios(terminos, anioFinal, objetivo.referencial);
+  if(parcial) aviso = 'SERCOP limitó las consultas; la búsqueda quedó incompleta. Intenta de nuevo en unos minutos.';
+  const conocidos = new Map();
+  const nuevos = [];
+  for(const candidato of ocids){
+    if(candidato === ocid) continue;
+    const guardado = leerComparable(candidato);
+    const vencido = guardado && !precios.esUtil(guardado) && Date.now() - Date.parse(guardado.syncedAt) > PRECIOS_TTL_MS;
+    if(guardado && !vencido) conocidos.set(candidato, guardado);
+    else nuevos.push(candidato);
+  }
+  let leidos = 0;
+  for(const candidato of nuevos.slice(0, PRECIOS_LOTE)){
+    if(sercopPaused()){ aviso = 'El portal de SERCOP está en pausa; el reporte quedó parcial.'; break; }
+    try{
+      conocidos.set(candidato, await descargarComparable(candidato));
+      leidos++;
+      await sleep(PRECIOS_PAUSA_MS);
+    }catch(error){
+      console.warn(`  [Precios] ${candidato}: ${error.message}`);
+      if(error.code === 'SERCOP_PAUSE' || isConnectFailure(error) || /429/.test(error.message || '')){
+        aviso = 'SERCOP limitó las consultas; el reporte quedó parcial.';
+        break;
+      }
+    }
+  }
+  const reporte = precios.construirReporte(objetivo, [...conocidos.values()], {
+    pendientes: nuevos.length - leidos,
+    periodo,
+    aviso
+  });
+  return {...reporte, terminos, url: sercopPublicUrl(ocid)};
+}
+
+function reportePrecios(ocid){
+  if(preciosEnCurso.has(ocid)) return preciosEnCurso.get(ocid);
+  const tarea = construirReportePrecios(ocid).finally(() => preciosEnCurso.delete(ocid));
+  preciosEnCurso.set(ocid, tarea);
+  return tarea;
+}
+
 function getFicha(ocid){
   const row = getProcessRow(ocid);
   if(!row) return null;
@@ -3651,6 +3762,17 @@ const server = http.createServer(async (req, res) => {
       const ficha = getFicha(decodeURIComponent(fichaMatch[1]));
       if(!ficha) return json(res, 404, {error:'proceso no encontrado'});
       return json(res, 200, ficha);
+    }
+    const preciosMatch = pathname.match(/^\/api\/procesos\/(.+)\/precios$/);
+    if(preciosMatch && req.method === 'GET'){
+      const ocid = decodeURIComponent(preciosMatch[1]);
+      if(!/^ocds-[A-Za-z0-9-]+$/.test(ocid)) return json(res, 400, {error:'ocid no válido'});
+      try{
+        return json(res, 200, await reportePrecios(ocid));
+      }catch(error){
+        console.warn(`  [Precios] ${ocid}: ${error.message}`);
+        return json(res, 502, {error:'SERCOP no entregó el registro de este proceso'});
+      }
     }
 
     // -- Search (SSE) --

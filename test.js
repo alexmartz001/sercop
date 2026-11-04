@@ -1560,3 +1560,158 @@ describe('tablero operativo', () => {
 });
 
 
+describe('Reporte de precios', () => {
+  const precios = require('./precios');
+  const registro = (overrides = {}) => ({
+    date: '2025-05-28T00:00:00-05:00',
+    buyer: {name: 'ENTIDAD UNO'},
+    tender: {
+      description: 'Licencias de antivirus',
+      procurementMethodDetails: 'Subasta Inversa Electrónica',
+      numberOfTenderers: 3,
+      items: [{
+        id: 'a', quantity: 2, unit: {value: {amount: 500}},
+        classification: {id: '512900011', scheme: 'CPC'},
+        additionalClassifications: [{id: '51290.00.1', scheme: 'CPC'}]
+      }]
+    },
+    awards: [{date: '2025-05-28T00:00:00-05:00', value: {amount: 800}, items: [{id: 'a'}], suppliers: [{id: 'EC-RUC-1792422426001-467734', name: 'PROVEEDOR UNO'}]}],
+    ...overrides
+  });
+  const comparable = (ocid, bajaPct, extra = {}) => ({
+    ocid, titulo: ocid, entidad: 'OTRA', fecha: '2025-01-01', cpcs: ['512900011'],
+    referencial: 1000, adjudicado: 1000 * (1 - bajaPct / 100), oferentes: 3, proveedores: [], bajaPct, ...extra
+  });
+  const objetivo = {ocid: 'x', titulo: 'x', entidad: 'ENTIDAD UNO', cpcs: ['512900011'], referencial: 10000};
+
+  it('calcula referencial y rebaja cuando SERCOP solo publica el precio por ítem', () => {
+    const c = precios.comparableDeRegistro('ocds-a', [registro()]);
+    assert.equal(c.referencial, 1000);
+    assert.equal(c.adjudicado, 800);
+    assert.equal(c.bajaPct, 20);
+    assert.equal(c.oferentes, 3);
+    assert.equal(c.proveedores[0].ruc, '1792422426001');
+    assert.ok(c.cpcs.includes('512900011'));
+  });
+
+  it('compara una adjudicación parcial solo contra los ítems adjudicados', () => {
+    const base = registro();
+    base.tender.items.push({id: 'b', quantity: 1, unit: {value: {amount: 9000}}, classification: {id: '512900011', scheme: 'CPC'}});
+    base.tender.value = {amount: 10000};
+    const c = precios.comparableDeRegistro('ocds-a', [base]);
+    assert.equal(c.referencial, 1000);
+    assert.equal(c.bajaPct, 20);
+  });
+
+  it('no inventa rebaja sin adjudicación o sin referencial, e ignora las canceladas', () => {
+    assert.equal(precios.comparableDeRegistro('p', [{planning: {rationale: 'Algo'}}]).bajaPct, null);
+    const cancelada = registro({awards: [{status: 'cancelled', value: {amount: 800}, items: [{id: 'a'}]}]});
+    assert.equal(precios.comparableDeRegistro('c', [cancelada]).adjudicado, null);
+    assert.equal(precios.esUtil({bajaPct: 95}), false);
+    assert.equal(precios.esUtil({bajaPct: -3}), false);
+    assert.equal(precios.esUtil({bajaPct: 12}), true);
+  });
+
+  it('interpola percentiles', () => {
+    assert.equal(precios.percentil([10, 20, 30, 40], 0.5), 25);
+    assert.equal(precios.percentil([], 0.5), null);
+    assert.equal(precios.percentil([7], 0.75), 7);
+  });
+
+  it('calcula el rango en dólares con el presupuesto del proceso', () => {
+    const items = [10, 20, 30, 40, 50].map((baja, i) => comparable(`c${i}`, baja));
+    const r = precios.construirReporte(objetivo, items, {pendientes: 4, periodo: '2024–2026'});
+    assert.equal(r.criterio.nivel, 'cpc');
+    assert.equal(r.suficiente, true);
+    assert.deepEqual(r.baja, {p25: 20, p50: 30, p75: 40});
+    assert.deepEqual(r.rangoSugerido, {desde: 6000, hasta: 8000, mediana: 7000});
+    assert.equal(r.cobertura.pendientes, 4);
+  });
+
+  it('avisa si la muestra es corta, excluye al propio proceso y no mezcla otro CPC', () => {
+    const r = precios.construirReporte(objetivo, [
+      comparable('x', 99),
+      comparable('misma-clase', 10, {cpcs: ['512900029']}),
+      comparable('otro-rubro', 50, {cpcs: ['999990011']})
+    ]);
+    assert.equal(r.criterio.nivel, 'clase');
+    assert.equal(r.muestra, 1);
+    assert.equal(r.suficiente, false);
+    assert.equal(r.similares[0].ocid, 'misma-clase');
+    const sinCoincidencia = precios.construirReporte(objetivo, [comparable('otro', 50, {cpcs: ['999990011']})]);
+    assert.equal(sinCoincidencia.muestra, 0);
+    assert.equal(sinCoincidencia.rangoSugerido, null);
+  });
+
+  it('usa el texto solo cuando el proceso no publica CPC, y sin rango si no hay presupuesto', () => {
+    const r = precios.construirReporte({ocid: 'x', titulo: 'x', entidad: '', cpcs: [], referencial: null}, [comparable('a', 25)]);
+    assert.equal(r.criterio.nivel, 'texto');
+    assert.equal(r.muestra, 1);
+    assert.equal(r.rangoSugerido, null);
+    assert.equal(r.suficiente, false);
+  });
+
+  it('no deja que las contrataciones directas lleven la rebaja a cero', () => {
+    const subasta = {...objetivo, modalidad: 'Subasta Inversa Electrónica'};
+    const directos = [1, 2, 3].map(i => comparable(`re${i}`, 0, {modalidad: 'Régimen Especial', oferentes: 1}));
+    const r = precios.construirReporte(subasta, [...directos, comparable('sie', 27, {modalidad: 'Subasta Inversa Electrónica', oferentes: 5})]);
+    assert.equal(r.muestra, 1);
+    assert.equal(r.baja.p50, 27);
+    const especial = precios.construirReporte({...objetivo, modalidad: 'Régimen Especial'}, directos);
+    assert.equal(especial.muestra, 3);
+    const misma = [10, 20, 30, 40, 50].map((baja, i) => comparable(`s${i}`, baja, {modalidad: 'Subasta Inversa Electrónica'}));
+    const conOtra = precios.construirReporte(subasta, [...misma, comparable('lic', 80, {modalidad: 'Licitación'})]);
+    assert.equal(conOtra.muestra, 5);
+    assert.match(conOtra.criterio.etiqueta, /misma modalidad/);
+  });
+
+  describe('ficha en sercop.html', () => {
+    const html = fs.readFileSync(path.join(__dirname, 'sercop.html'), 'utf8');
+    const bloque = html.slice(html.indexOf('// ficha:puro-inicio'), html.indexOf('// ficha:puro-fin'));
+    const { rangoBarra, fichaDesdeUrl, fichaUrl } = new Function(`${bloque}; return {rangoBarra, fichaDesdeUrl, fichaUrl};`)();
+
+    it('ubica la banda y la mediana como parte del presupuesto', () => {
+      const barra = rangoBarra({presupuesto: 10000, rangoSugerido: {desde: 6000, hasta: 8000, mediana: 7000}});
+      assert.equal(barra.desde, 60);
+      assert.equal(barra.ancho, 20);
+      assert.equal(barra.mediana, 70);
+      assert.equal(barra.etiqueta, '');
+    });
+
+    it('no dibuja barra sin presupuesto o sin rango', () => {
+      assert.equal(rangoBarra({presupuesto: null, rangoSugerido: null}), null);
+      assert.equal(rangoBarra({presupuesto: 0, rangoSugerido: {desde: 1, hasta: 2, mediana: 1}}), null);
+      assert.equal(rangoBarra({presupuesto: 1000, rangoSugerido: null}), null);
+    });
+
+    it('mantiene visible una banda sin ancho y dentro de la barra', () => {
+      const sinRebaja = rangoBarra({presupuesto: 1000, rangoSugerido: {desde: 1000, hasta: 1000, mediana: 1000}});
+      assert.ok(sinRebaja.ancho > 0);
+      assert.ok(sinRebaja.desde + sinRebaja.ancho <= 100);
+      assert.equal(sinRebaja.etiqueta, 'fin');
+      const conRebaja = rangoBarra({presupuesto: 1000, rangoSugerido: {desde: 100, hasta: 100, mediana: 100}});
+      assert.ok(conRebaja.desde >= 0);
+      assert.equal(conRebaja.etiqueta, 'ini');
+    });
+
+    it('el enlace de una sección se puede leer de vuelta', () => {
+      const ocid = 'ocds-5wno2w-SIE-X/2026 &1';
+      const qs = fichaUrl(ocid, 'precios').split('#')[0].slice(1);
+      assert.deepEqual(fichaDesdeUrl(qs), {ocid, sec: 'precios'});
+    });
+
+    it('ignora secciones que no existen', () => {
+      assert.deepEqual(fichaDesdeUrl('?ficha=a&s=<script>'), {ocid: 'a', sec: 'cronograma'});
+      assert.equal(fichaDesdeUrl('').ocid, '');
+    });
+  });
+
+  it('extrae términos sin confundir mayúsculas con siglas', () => {
+    assert.equal(precios.terminosBusqueda('Plataforma para detección de amenazas (XDR) en el SERCOP')[0], 'xdr');
+    assert.ok(!precios.terminosBusqueda('Plataforma para detección de amenazas (XDR) en el SERCOP').includes('sercop'));
+    const mayus = precios.terminosBusqueda('ADQUISICION DE AGUA PURIFICADA PARA LA ENTIDAD');
+    assert.ok(mayus.includes('purificada'));
+    assert.ok(!mayus.includes('agua'));
+    assert.ok(!mayus.includes('adquisicion'));
+  });
+});
